@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>Pipeline Validation</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #171b22;
+    --line: #2a313c;
+    --text: #e8ecf1;
+    --muted: #9aa4b2;
+    --accent: #ff4d5e;
+    --ok: #3ccf91;
+    --warn: #f5b041;
+    --truth: #8ab4ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+    line-height: 1.45;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 16px 0 40px; }
+  h1 { font-size: 1.5rem; margin: 8px 0 4px; }
+  h2 { font-size: 1.2rem; margin: 0 0 4px; }
+  h3 { font-size: 0.95rem; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  p { margin: 8px 0; }
+  a { color: var(--truth); }
+  .small { font-size: 0.85rem; color: var(--muted); }
+  .scope {
+    border: 1px solid var(--warn);
+    background: rgba(245, 176, 65, 0.08);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 14px 0;
+    font-size: 0.92rem;
+  }
+  .scope strong { color: var(--warn); }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px;
+    margin: 16px 0;
+  }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 4px; border-bottom: 1px solid var(--line); text-align: right; font-size: 0.88rem; }
+  #summary-table td { white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.78rem; }
+  th:first-child, td:first-child { text-align: left; }
+  .pass { color: var(--ok); font-weight: 700; }
+  .fail { color: var(--accent); font-weight: 700; }
+  .stat-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 8px 0; }
+  .stat {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .stat .label { font-size: 0.75rem; color: var(--muted); }
+  .stat .value { font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  canvas.chart {
+    display: block;
+    width: 100%;
+    background: var(--bg);
+    border-radius: 8px;
+    border: 1px solid var(--line);
+  }
+  canvas.ibi { height: 190px; }
+  canvas.raw { height: 90px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 0.8rem; color: var(--muted); margin: 6px 0; }
+  .legend span::before {
+    content: '';
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-right: 5px;
+    vertical-align: -1px;
+  }
+  .legend .lg-truth::before { border: 2px solid var(--truth); width: 7px; height: 7px; }
+  .legend .lg-kept::before { background: var(--accent); }
+  .legend .lg-rej::before { background: var(--warn); border-radius: 0; transform: rotate(45deg); width: 8px; height: 8px; }
+  .gate-line { font-size: 0.92rem; margin: 6px 0; }
+  .callout {
+    border-left: 3px solid var(--warn);
+    padding: 6px 10px;
+    margin: 8px 0;
+    font-size: 0.88rem;
+    background: var(--bg);
+    border-radius: 0 6px 6px 0;
+  }
+  button {
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--text);
+    width: 100%;
+    margin: 8px 0;
+    cursor: pointer;
+  }
+  details { margin: 8px 0; }
+  summary { cursor: pointer; color: var(--muted); font-size: 0.9rem; }
+  code { font-size: 0.85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Signal-Processing Validation</h1>
+  <p class="small">
+    Synthetic pulse signals with <b>known</b> heartbeat times are pushed through the exact
+    same <code>dsp.js</code> pipeline the camera app uses (<code>analyzeRecording()</code>),
+    and the output is compared with the known truth.
+  </p>
+
+  <div class="scope">
+    <strong>Scope:</strong> this validates the signal-processing pipeline only.
+    It makes no claim about clinical accuracy. The app has not been validated against ECG
+    and is not a medical device.
+  </div>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <table id="summary-table"></table>
+    <p class="small" id="seed-line"></p>
+    <button id="btn-reseed">Re-run with a new random seed</button>
+  </div>
+
+  <div id="cases"></div>
+
+  <div class="card">
+    <h2>How the test signals are built</h2>
+    <p class="small">
+      Each recording is 45 s long. Beat times are generated first (the ground truth). A pulse
+      shape is placed at every beat time: a sharp rise to the main (systolic) peak,
+      a slower fall, and a small second bump about 330 ms later (the dicrotic wave).
+      The pulse is subtracted from a steady brightness of 180, because in the camera image the
+      brightness <i>dips</i> with each beat. Random Gaussian sensor noise is added.
+      Samples are taken at about 30 frames per second with random timing jitter, like a
+      real phone camera.
+    </p>
+    <table id="synth-table"></table>
+    <h3>Pipeline settings under test (from dsp.js)</h3>
+    <table id="params-table"></table>
+    <p class="small">
+      Scoring: a detected beat counts as matching a true beat if it lies within
+      ±150 ms of it. Only true beats between 1 s and 44 s are scored, so beats cut off by the
+      start or end of the recording don't count against the pipeline. Interval error is
+      measured for every pair of consecutive true beats that were both matched.
+    </p>
+  </div>
+
+  <p class="small"><a href="./index.html">← Back to the app</a></p>
+</main>
+
+<script type="module">
+// ============================================================================
+// validate.html: synthetic validation harness.
+//
+// The logic here only (1) generates test signals with known beat times and
+// (2) scores the pipeline's output. ALL signal processing is done by
+// dsp.analyzeRecording(), the same function index.html calls on camera data.
+// ============================================================================
+import * as dsp from './dsp.js';
+
+// ---------------------------------------------------------------------------
+// Synthesis settings (design choices for the test, shown on the page)
+// ---------------------------------------------------------------------------
+const SYNTH = {
+  DURATION_MS: 45000,
+  FRAME_INTERVAL_MS: 1000 / 30,  // ~30 fps camera
+  FRAME_JITTER_SD_MS: 1.5,       // random timing jitter per frame
+  BASELINE: 180,                 // steady red brightness (0..255 scale)
+  PULSE_AMPLITUDE: 3,            // brightness dip at each beat
+  NOISE_SD: 0.3,                 // Gaussian sensor noise (1/10 of pulse amplitude)
+  FIRST_BEAT_MS: 300,
+  MATCH_TOLERANCE_MS: 150,       // detected beat must be within ±150 ms of a true beat
+  SCORE_START_MS: 1000,          // only score beats between 1 s and 44 s
+  SCORE_END_MS: 44000,
+};
+
+// The three test cases. Each defines how the next true interval is drawn,
+// and whether a motion artifact is added.
+const CASES = [
+  {
+    id: 'A',
+    name: 'Regular',
+    description: 'Constant 850 ms interval (≈71 bpm) with 15 ms Gaussian jitter.',
+    nextIbi: (rand) => 850 + 15 * gaussian(rand),
+    artifact: false,
+    expectedGatePass: true,
+    expectedVerdict: dsp.VERDICTS.REGULAR,
+  },
+  {
+    id: 'B',
+    name: 'Irregular',
+    description: 'Every interval drawn uniformly at random between 500 and 1200 ms, ' +
+                 'mimicking an irregular rhythm.',
+    nextIbi: (rand) => 500 + 700 * rand(),
+    artifact: false,
+    expectedGatePass: true,
+    expectedVerdict: dsp.VERDICTS.IRREGULAR,
+  },
+  {
+    id: 'C',
+    name: 'Noisy (motion)',
+    description: 'Case A plus a large motion artifact from 15 s to 25 s: a 0.4 Hz sway ' +
+                 '(5× the pulse size) and a 1.1 Hz shake (2.7× the pulse size).',
+    nextIbi: (rand) => 850 + 15 * gaussian(rand),
+    artifact: true,
+    expectedGatePass: false,
+    expectedVerdict: dsp.VERDICTS.INSUFFICIENT,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Random numbers. A seeded generator (mulberry32) makes every run
+// reproducible: the same seed always produces the same test signals.
+// ---------------------------------------------------------------------------
+function makeRandom(seed) {
+  let state = seed >>> 0;
+  return function () {
+    state = (state + 0x6D2B79F5) >>> 0;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Standard normal random number (mean 0, SD 1), Box–Muller method.
+function gaussian(rand) {
+  let u = rand();
+  if (u < 1e-12) u = 1e-12;
+  const v = rand();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// ---------------------------------------------------------------------------
+// Pulse shape. dtMs is time relative to the systolic peak.
+//   * rise:  half-Gaussian with SD 60 ms before the peak (sharp upstroke)
+//   * fall:  half-Gaussian with SD 160 ms after the peak (slower decay)
+//   * dicrotic wave: small Gaussian bump (25% height) 330 ms after the peak
+// This is a simplified shape for testing, not a physiological model.
+// ---------------------------------------------------------------------------
+function pulseShape(dtMs) {
+  let systolic;
+  if (dtMs < 0) {
+    systolic = Math.exp(-0.5 * (dtMs / 60) * (dtMs / 60));
+  } else {
+    systolic = Math.exp(-0.5 * (dtMs / 160) * (dtMs / 160));
+  }
+  const dicrotic = 0.25 * Math.exp(-0.5 * ((dtMs - 330) / 80) * ((dtMs - 330) / 80));
+  return systolic + dicrotic;
+}
+
+// Motion artifact for case C (brightness units), active from 15 s to 25 s.
+function motionArtifact(tMs) {
+  if (tMs < 15000 || tMs > 25000) return 0;
+  const sway = 15 * Math.sin(2 * Math.PI * 0.4 * (tMs - 15000) / 1000);
+  const shake = 8 * Math.sin(2 * Math.PI * 1.1 * tMs / 1000);
+  return sway + shake;
+}
+
+// Build one synthetic recording.
+// Returns { beatTimesMs (ground truth), samples [{tMs, value}] }.
+function synthesize(testCase, rand) {
+  // 1. Ground-truth beat times.
+  const beatTimesMs = [];
+  let t = SYNTH.FIRST_BEAT_MS;
+  while (t < SYNTH.DURATION_MS) {
+    beatTimesMs.push(t);
+    t += testCase.nextIbi(rand);
+  }
+
+  // 2. Camera-like samples at jittered times.
+  const samples = [];
+  let frameT = 0;
+  while (frameT < SYNTH.DURATION_MS) {
+    let pulse = 0;
+    for (const beat of beatTimesMs) {
+      const dt = frameT - beat;
+      if (dt > -400 && dt < 900) pulse += pulseShape(dt); // shape is ~0 outside this range
+    }
+    let value = SYNTH.BASELINE - SYNTH.PULSE_AMPLITUDE * pulse + SYNTH.NOISE_SD * gaussian(rand);
+    if (testCase.artifact) value += motionArtifact(frameT);
+    samples.push({ tMs: frameT, value: value });
+
+    let step = SYNTH.FRAME_INTERVAL_MS + SYNTH.FRAME_JITTER_SD_MS * gaussian(rand);
+    if (step < 20) step = 20; // keep timestamps moving forward
+    frameT += step;
+  }
+  return { beatTimesMs: beatTimesMs, samples: samples };
+}
+
+// ---------------------------------------------------------------------------
+// Scoring: compare detected beats with the ground truth.
+// ---------------------------------------------------------------------------
+function scoreBeats(trueBeats, detectedBeats) {
+  const inWindow = (t) => t >= SYNTH.SCORE_START_MS && t <= SYNTH.SCORE_END_MS;
+  const used = new Array(detectedBeats.length).fill(false);
+  const matchOf = new Array(trueBeats.length).fill(-1); // index of matched detected beat
+
+  // Each true beat takes the nearest unused detected beat within tolerance.
+  for (let i = 0; i < trueBeats.length; i++) {
+    if (!inWindow(trueBeats[i])) continue;
+    let best = -1;
+    let bestDist = Infinity;
+    for (let j = 0; j < detectedBeats.length; j++) {
+      if (used[j]) continue;
+      const dist = Math.abs(detectedBeats[j] - trueBeats[i]);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = j;
+      }
+    }
+    if (best >= 0 && bestDist <= SYNTH.MATCH_TOLERANCE_MS) {
+      used[best] = true;
+      matchOf[i] = best;
+    }
+  }
+
+  let scoredTrue = 0;
+  let missed = 0;
+  for (let i = 0; i < trueBeats.length; i++) {
+    if (!inWindow(trueBeats[i])) continue;
+    scoredTrue += 1;
+    if (matchOf[i] === -1) missed += 1;
+  }
+  let spurious = 0;
+  for (let j = 0; j < detectedBeats.length; j++) {
+    if (inWindow(detectedBeats[j]) && !used[j]) spurious += 1;
+  }
+
+  // Interval errors for consecutive true beats that were both matched.
+  const ibiErrors = [];
+  for (let i = 0; i + 1 < trueBeats.length; i++) {
+    if (matchOf[i] === -1 || matchOf[i + 1] === -1) continue;
+    const trueIbi = trueBeats[i + 1] - trueBeats[i];
+    const detectedIbi = detectedBeats[matchOf[i + 1]] - detectedBeats[matchOf[i]];
+    ibiErrors.push(Math.abs(detectedIbi - trueIbi));
+  }
+
+  return {
+    scoredTrue: scoredTrue,
+    missed: missed,
+    spurious: spurious,
+    ibiErrors: ibiErrors,
+    meanAbsErrorMs: ibiErrors.length ? dsp.mean(ibiErrors) : NaN,
+    maxErrorMs: ibiErrors.length ? Math.max(...ibiErrors) : NaN,
+  };
+}
+
+// Ground-truth intervals whose two beats both fall inside the recording,
+// with their times. Uses the full recording (like the pipeline does), so the
+// truth metrics and the pipeline metrics cover the same stretch of time.
+function trueIntervals(trueBeats) {
+  const times = [];
+  const ibis = [];
+  for (let i = 0; i + 1 < trueBeats.length; i++) {
+    if (trueBeats[i + 1] > SYNTH.DURATION_MS) continue;
+    times.push(trueBeats[i + 1]);
+    ibis.push(trueBeats[i + 1] - trueBeats[i]);
+  }
+  return { times: times, ibis: ibis };
+}
+
+// ---------------------------------------------------------------------------
+// Drawing (plain canvas 2D)
+// ---------------------------------------------------------------------------
+function prepareCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx: ctx, width: w, height: h };
+}
+
+// Overlay: true intervals (hollow blue circles joined by a line), accepted
+// detected intervals (red dots), rejected detected intervals (orange diamonds).
+function drawIbiOverlay(canvas, truth, keptTimes, keptIbis, rejectedTimes, rejectedIbis) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  const left = 46;
+  const bottom = 18;
+  const plotW = width - left - 8;
+  const plotH = height - bottom - 10;
+
+  const all = truth.ibis.concat(keptIbis);
+  let lo = Math.min(...all);
+  let hi = Math.max(...all);
+  if (hi - lo < 400) {
+    const mid = (hi + lo) / 2;
+    lo = mid - 200;
+    hi = mid + 200;
+  }
+  lo = Math.floor(lo / 100) * 100;
+  hi = Math.ceil(hi / 100) * 100;
+  // Keep rejected points visible but clamp wild ones to the chart edge.
+  const clampY = (v) => Math.max(lo, Math.min(hi, v));
+  const xOf = (t) => left + (t / SYNTH.DURATION_MS) * plotW;
+  const yOf = (v) => 10 + (1 - (clampY(v) - lo) / (hi - lo)) * plotH;
+
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.fillStyle = '#9aa4b2';
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.textAlign = 'right';
+  const step = (hi - lo) > 800 ? 200 : 100;
+  for (let v = lo; v <= hi; v += step) {
+    ctx.beginPath();
+    ctx.moveTo(left, yOf(v));
+    ctx.lineTo(width - 8, yOf(v));
+    ctx.stroke();
+    ctx.fillText(v + ' ms', left - 4, yOf(v) + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let s = 0; s <= 45; s += 10) ctx.fillText(s + 's', xOf(s * 1000), height - 4);
+
+  // Truth line + hollow circles.
+  ctx.strokeStyle = 'rgba(138,180,255,0.45)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < truth.ibis.length; i++) {
+    const x = xOf(truth.times[i]);
+    const y = yOf(truth.ibis[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = '#8ab4ff';
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < truth.ibis.length; i++) {
+    ctx.beginPath();
+    ctx.arc(xOf(truth.times[i]), yOf(truth.ibis[i]), 4.5, 0, 2 * Math.PI);
+    ctx.stroke();
+  }
+
+  // Detected, accepted.
+  ctx.fillStyle = '#ff4d5e';
+  for (let i = 0; i < keptIbis.length; i++) {
+    ctx.beginPath();
+    ctx.arc(xOf(keptTimes[i]), yOf(keptIbis[i]), 2.6, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+
+  // Detected, rejected by filterIBIs.
+  ctx.fillStyle = '#f5b041';
+  for (let i = 0; i < rejectedIbis.length; i++) {
+    const x = xOf(rejectedTimes[i]);
+    const y = yOf(rejectedIbis[i]);
+    ctx.beginPath();
+    ctx.moveTo(x, y - 4);
+    ctx.lineTo(x + 4, y);
+    ctx.lineTo(x, y + 4);
+    ctx.lineTo(x - 4, y);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+// The raw synthetic input, in camera convention (dips = beats).
+function drawRawInput(canvas, samples) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const s of samples) {
+    if (s.value < lo) lo = s.value;
+    if (s.value > hi) hi = s.value;
+  }
+  const range = (hi - lo) || 1;
+  ctx.strokeStyle = '#9aa4b2';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < samples.length; i++) {
+    const x = (samples[i].tMs / SYNTH.DURATION_MS) * width;
+    const y = 6 + (1 - (samples[i].value - lo) / range) * (height - 12);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// ---------------------------------------------------------------------------
+// Page building helpers
+// ---------------------------------------------------------------------------
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function fillTable(table, headers, rows) {
+  table.innerHTML = '';
+  if (headers) {
+    const tr = el('tr');
+    for (const h of headers) tr.appendChild(el('th', '', h));
+    table.appendChild(tr);
+  }
+  for (const row of rows) {
+    const tr = el('tr');
+    for (const cell of row) {
+      const td = el('td');
+      if (cell && typeof cell === 'object') {
+        td.textContent = cell.text;
+        td.className = cell.className || '';
+      } else {
+        td.textContent = cell;
+      }
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  }
+}
+
+function fmt(value, digits, unit) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return 'n/a';
+  return value.toFixed(digits) + (unit || '');
+}
+
+function stat(label, value) {
+  const box = el('div', 'stat');
+  box.appendChild(el('div', 'label', label));
+  box.appendChild(el('div', 'value', value));
+  return box;
+}
+
+// ---------------------------------------------------------------------------
+// Run one case and render its card.
+// ---------------------------------------------------------------------------
+function runCase(testCase, seed) {
+  // Each case gets its own seed derived from the run seed, so changing one
+  // case's code never shifts another case's random numbers.
+  const rand = makeRandom(seed * 31 + testCase.id.charCodeAt(0));
+  const synthetic = synthesize(testCase, rand);
+
+  // >>> The pipeline under test: the same call index.html makes. <<<
+  const analysis = dsp.analyzeRecording(synthetic.samples);
+
+  const score = scoreBeats(synthetic.beatTimesMs, analysis.peakTimesMs);
+  const truth = trueIntervals(synthetic.beatTimesMs);
+  const truthMetrics = dsp.computeMetrics(truth.ibis);
+
+  // What the verdict WOULD have been with no quality gate (for case C).
+  const ungated = dsp.classify(analysis.metrics, null);
+
+  const gateCorrect = analysis.quality.pass === testCase.expectedGatePass;
+  const verdictCorrect = analysis.classification.verdict === testCase.expectedVerdict;
+
+  // ----- Card -----
+  const card = el('div', 'card');
+  card.appendChild(el('h2', '', 'Case ' + testCase.id + ': ' + testCase.name));
+  card.appendChild(el('p', 'small', testCase.description));
+
+  card.appendChild(el('h3', '', 'Synthetic input (raw brightness)'));
+  const rawCanvas = el('canvas', 'chart raw');
+  card.appendChild(rawCanvas);
+
+  card.appendChild(el('h3', '', 'Beat-to-beat intervals: truth vs detected'));
+  const ibiCanvas = el('canvas', 'chart ibi');
+  card.appendChild(ibiCanvas);
+  const legend = el('div', 'legend');
+  legend.appendChild(el('span', 'lg-truth', 'Ground truth'));
+  legend.appendChild(el('span', 'lg-kept', 'Detected, accepted'));
+  legend.appendChild(el('span', 'lg-rej', 'Detected, rejected by filter'));
+  card.appendChild(legend);
+  card.appendChild(el('p', 'small', 'Points outside the chart range are drawn on its top or bottom edge.'));
+
+  card.appendChild(el('h3', '', 'Beat detection'));
+  const grid = el('div', 'stat-grid');
+  grid.appendChild(stat('Interval error, mean (MAE)', fmt(score.meanAbsErrorMs, 1, ' ms')));
+  grid.appendChild(stat('Interval error, max', fmt(score.maxErrorMs, 1, ' ms')));
+  grid.appendChild(stat('Missed beats', score.missed + ' of ' + score.scoredTrue));
+  grid.appendChild(stat('Spurious beats', String(score.spurious)));
+  card.appendChild(grid);
+  card.appendChild(el('p', 'small',
+    analysis.ibiResult.rejectedCount + ' of ' + analysis.ibiResult.total +
+    ' detected intervals were rejected by the interval filter.'));
+
+  card.appendChild(el('h3', '', 'Metrics: truth vs pipeline'));
+  const metricsTable = el('table');
+  const m = analysis.metrics;
+  const tm = truthMetrics;
+  fillTable(metricsTable, ['Metric', 'Truth', 'Pipeline'], [
+    ['Mean HR', fmt(tm.meanHR, 1, ' bpm'), fmt(m.meanHR, 1, ' bpm')],
+    ['RMSSD', fmt(tm.rmssd, 1, ' ms'), fmt(m.rmssd, 1, ' ms')],
+    ['pNN50', fmt(tm.pnn50, 1, ' %'), fmt(m.pnn50, 1, ' %')],
+    ['Shannon entropy', fmt(tm.shannonEntropy, 3), fmt(m.shannonEntropy, 3)],
+    ['Sample entropy', fmt(tm.sampleEntropy, 3), fmt(m.sampleEntropy, 3) + (m.sampleEntropyLowConfidence ? ' *' : '')],
+    ['Intervals', String(tm.beatCount), String(m.beatCount)],
+  ]);
+  card.appendChild(metricsTable);
+  if (m.sampleEntropyLowConfidence) {
+    card.appendChild(el('p', 'small', '* low confidence: fewer than ' + dsp.SAMPLE_ENTROPY_MIN_INTERVALS +
+      ' intervals, so it is not used in the verdict.'));
+  }
+
+  card.appendChild(el('h3', '', 'Quality gate and verdict'));
+  const gateLine = el('div', 'gate-line');
+  gateLine.appendChild(document.createTextNode('Gate: expected '));
+  gateLine.appendChild(el('b', '', testCase.expectedGatePass ? 'PASS' : 'REJECT'));
+  gateLine.appendChild(document.createTextNode(', got '));
+  gateLine.appendChild(el('b', '', analysis.quality.pass ? 'PASS' : 'REJECT'));
+  gateLine.appendChild(document.createTextNode(' → '));
+  gateLine.appendChild(el('span', gateCorrect ? 'pass' : 'fail', gateCorrect ? '✓ correct' : '✗ wrong'));
+  card.appendChild(gateLine);
+
+  const verdictLine = el('div', 'gate-line');
+  verdictLine.appendChild(document.createTextNode('Verdict: '));
+  verdictLine.appendChild(el('b', '', analysis.classification.verdict));
+  verdictLine.appendChild(document.createTextNode(' '));
+  verdictLine.appendChild(el('span', verdictCorrect ? 'pass' : 'fail', verdictCorrect ? '✓' : '✗ expected ' + testCase.expectedVerdict));
+  card.appendChild(verdictLine);
+
+  if (analysis.quality.reasons.length > 0) {
+    const ul = el('ul', 'small');
+    ul.style.margin = '4px 0';
+    ul.style.paddingLeft = '18px';
+    for (const reason of analysis.quality.reasons) ul.appendChild(el('li', '', reason));
+    card.appendChild(ul);
+  }
+  if (!testCase.expectedGatePass) {
+    card.appendChild(el('div', 'callout',
+      'Without the quality gate, this recording would have been labelled: "' + ungated.verdict +
+      '". Motion can mimic an irregular rhythm, which is why the gate runs before any verdict.'));
+  }
+
+  const checkDetails = el('details');
+  checkDetails.appendChild(el('summary', '', 'All quality checks'));
+  const checkTable = el('table');
+  fillTable(checkTable, ['Check', 'Value', 'Limit', ''], analysis.quality.checks.map((c) => {
+    let value;
+    if (c.name === 'Intervals rejected') value = fmt(c.value * 100, 0, '%');
+    else if (c.name === 'Valid beat intervals') value = String(c.value);
+    else if (/frame/i.test(c.name)) value = fmt(c.value, 1, ' ms');
+    else value = fmt(c.value, 2);
+    return [c.name, value, c.limitText, { text: c.pass ? '✓' : '✗', className: c.pass ? 'pass' : 'fail' }];
+  }));
+  checkDetails.appendChild(checkTable);
+  card.appendChild(checkDetails);
+
+  document.getElementById('cases').appendChild(card);
+
+  // Charts are drawn after the card is in the page (canvases need a size).
+  drawRawInput(rawCanvas, synthetic.samples);
+  const keptTimes = analysis.keptIbiTimesMs;
+  const rejectedTimes = analysis.ibiResult.rejectedIndices.map((i) => analysis.peakTimesMs[i + 1]);
+  const rejectedIbis = analysis.ibiResult.rejectedIndices.map((i) => analysis.ibis[i]);
+  drawIbiOverlay(ibiCanvas, truth, keptTimes, analysis.ibiResult.kept, rejectedTimes, rejectedIbis);
+
+  return {
+    testCase: testCase,
+    gateCorrect: gateCorrect,
+    verdictCorrect: verdictCorrect,
+    quality: analysis.quality,
+    verdict: analysis.classification.verdict,
+    score: score,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Run everything
+// ---------------------------------------------------------------------------
+function runAll(seed) {
+  document.getElementById('cases').innerHTML = '';
+  const results = CASES.map((c) => runCase(c, seed));
+
+  // Short verdict names so the table fits a phone screen.
+  const shortVerdict = (v) => {
+    if (v === dsp.VERDICTS.REGULAR) return 'Regular';
+    if (v === dsp.VERDICTS.IRREGULAR) return 'Irregular';
+    return 'Insufficient';
+  };
+  fillTable(document.getElementById('summary-table'),
+    ['Case', 'Gate', 'Verdict', 'MAE (ms)'],
+    results.map((r) => [
+      r.testCase.id + ' · ' + r.testCase.name.split(' ')[0],
+      { text: (r.quality.pass ? 'pass' : 'reject') + (r.gateCorrect ? ' ✓' : ' ✗'),
+        className: r.gateCorrect ? 'pass' : 'fail' },
+      { text: shortVerdict(r.verdict) + (r.verdictCorrect ? ' ✓' : ' ✗'),
+        className: r.verdictCorrect ? 'pass' : 'fail' },
+      fmt(r.score.meanAbsErrorMs, 1),
+    ]));
+  document.getElementById('seed-line').textContent =
+    'Random seed: ' + seed + '. The same seed always reproduces the same signals ' +
+    '(add ?seed=' + seed + ' to the page address). ✓ means the pipeline gave the expected outcome.';
+}
+
+function renderStaticTables() {
+  fillTable(document.getElementById('synth-table'), null, [
+    ['Duration', SYNTH.DURATION_MS / 1000 + ' s'],
+    ['Frame rate', '≈30 fps, ' + SYNTH.FRAME_JITTER_SD_MS + ' ms timing jitter (SD)'],
+    ['Pulse size', SYNTH.PULSE_AMPLITUDE + ' brightness units'],
+    ['Sensor noise', SYNTH.NOISE_SD + ' brightness units (SD)'],
+    ['Pulse shape', 'rise SD 60 ms, fall SD 160 ms, dicrotic bump +330 ms'],
+  ]);
+  const params = [];
+  for (const key of Object.keys(dsp.DEFAULTS)) params.push([key, String(dsp.DEFAULTS[key])]);
+  fillTable(document.getElementById('params-table'), null, params);
+}
+
+const urlSeed = parseInt(new URLSearchParams(location.search).get('seed'), 10);
+let currentSeed = Number.isFinite(urlSeed) ? urlSeed : 1;
+
+renderStaticTables();
+runAll(currentSeed);
+
+document.getElementById('btn-reseed').addEventListener('click', () => {
+  currentSeed = Math.floor(Math.random() * 100000);
+  history.replaceState(null, '', '?seed=' + currentSeed);
+  runAll(currentSeed);
+  window.scrollTo(0, 0);
+});
+</script>
+</body>
+</html>
