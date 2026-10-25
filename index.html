@@ -123,9 +123,12 @@
     <h2>How to measure</h2>
     <ol class="howto">
       <li>Sit down and rest quietly for a minute.</li>
-      <li>Rest your index fingertip over the <b>rear camera and the flash</b> together.
-          Press lightly: pressing hard squeezes the blood out and the pulse disappears.</li>
-      <li>Keep your hand and phone still for about 50 seconds (5 s to settle + 45 s recording).</li>
+      <li>Lay the phone flat on a table, camera side up.</li>
+      <li>Cover the <b>main rear camera lens</b> with the pad of your index fingertip and let
+          your finger lie flat so the flash shines into it. Press lightly: pressing hard
+          squeezes the blood out and the pulse disappears.</li>
+      <li>Check the small round preview: it should glow an even red.</li>
+      <li>Keep still for about 50 seconds (5 s to settle + 45 s recording).</li>
     </ol>
 
     <button id="btn-start">Start measurement</button>
@@ -328,16 +331,41 @@ async function startCamera() {
     throw new Error('Camera access is not available. The page must be opened over HTTPS (or localhost).');
   }
 
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: false,
-    video: {
-      facingMode: { ideal: 'environment' }, // rear camera, but fall back to any camera
-      width: { ideal: 640 },
-      height: { ideal: 480 },
-      frameRate: { ideal: 30 },
-    },
-  });
+  const videoConstraints = {
+    facingMode: { ideal: 'environment' }, // rear camera, but fall back to any camera
+    width: { ideal: 640 },
+    height: { ideal: 480 },
+    frameRate: { ideal: 30 },
+  };
+  stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
   track = stream.getVideoTracks()[0];
+
+  // iPhones often hand us a "virtual" camera ("Back Dual Wide Camera",
+  // "Back Triple Camera") that combines several lenses and can silently switch
+  // between them. With a finger on one lens, it might record through the
+  // other. If a single-lens "Back Camera" exists, reopen with that instead.
+  // (Device labels are only readable after permission was granted, which is
+  // why this happens after the first getUserMedia call.)
+  if (/dual|triple/i.test(track.label)) {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const singleLens = devices.find((d) => d.kind === 'videoinput' && d.label === 'Back Camera');
+      if (singleLens) {
+        for (const t of stream.getTracks()) t.stop();
+        const singleConstraints = Object.assign({}, videoConstraints, { deviceId: { exact: singleLens.deviceId } });
+        delete singleConstraints.facingMode;
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: singleConstraints });
+        track = stream.getVideoTracks()[0];
+      }
+    } catch (err) {
+      // If switching fails, reopen the original camera rather than giving up.
+      console.warn('Could not switch to single-lens camera:', err);
+      if (!track || track.readyState === 'ended') {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+        track = stream.getVideoTracks()[0];
+      }
+    }
+  }
   appliedAdvanced = {};
 
   video.srcObject = stream;
