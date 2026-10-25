@@ -587,6 +587,192 @@ export function computeMetrics(ibis, originalIndices) {
 }
 
 // ---------------------------------------------------------------------------
+// STAGE 7: QUALITY GATE
+// ---------------------------------------------------------------------------
+
+// Quality limits. A recording failing ANY of these gets no rhythm verdict.
+//   MIN_VALID_INTERVALS and MAX_REJECTED_FRACTION come from the project's
+//   design spec. The others are PROVISIONAL developer choices (round numbers,
+//   not from a paper) and are labelled that way in the UI.
+export const QUALITY_LIMITS = Object.freeze({
+  MIN_VALID_INTERVALS: 20,            // design spec: need at least 20 accepted intervals
+  MAX_REJECTED_FRACTION: 0.20,        // design spec: at most 20% of intervals rejected
+  MAX_AMPLITUDE_CV: 0.5,              // PROVISIONAL: beat heights may vary by at most 50% (CV)
+  MAX_MEDIAN_FRAME_INTERVAL_MS: 50,   // PROVISIONAL: camera must deliver >= 20 fps
+  MAX_FRAME_INTERVAL_IQR_MS: 15,      // PROVISIONAL: frame-timing spread (IQR) at most 15 ms
+  MAX_FRAME_GAP_MS: 500,              // PROVISIONAL: no single gap between frames over 0.5 s
+});
+
+// Percentile by sorting and picking the nearest rank (q between 0 and 1).
+function percentile(values, q) {
+  if (values.length === 0) return NaN;
+  const sorted = values.slice().sort((a, b) => a - b);
+  return sorted[Math.round(q * (sorted.length - 1))];
+}
+
+// frameTimingStats(frameTimesMs)
+//
+// Summarizes how evenly the camera delivered frames.
+//   medianMs : typical time between frames (33.3 ms = 30 fps)
+//   iqrMs    : interquartile range of the intervals, i.e. the spread of the
+//              middle 50% (small = steady timing)
+//   maxGapMs : the single longest pause between frames
+export function frameTimingStats(frameTimesMs) {
+  const intervals = [];
+  for (let i = 1; i < frameTimesMs.length; i++) {
+    intervals.push(frameTimesMs[i] - frameTimesMs[i - 1]);
+  }
+  return {
+    medianMs: median(intervals),
+    iqrMs: percentile(intervals, 0.75) - percentile(intervals, 0.25),
+    maxGapMs: intervals.length ? Math.max(...intervals) : NaN,
+    frameCount: frameTimesMs.length,
+  };
+}
+
+// Pearson correlation of two equal-length arrays (-1..1).
+function correlation(a, b) {
+  const ma = mean(a);
+  const mb = mean(b);
+  let num = 0;
+  let da = 0;
+  let db = 0;
+  for (let i = 0; i < a.length; i++) {
+    num += (a[i] - ma) * (b[i] - mb);
+    da += (a[i] - ma) * (a[i] - ma);
+    db += (b[i] - mb) * (b[i] - mb);
+  }
+  if (da === 0 || db === 0) return 0;
+  return num / Math.sqrt(da * db);
+}
+
+// beatShapeSQI(signal, peaks, sampleRateHz, medianIbiMs)
+//
+// Signal quality index (SQI), 0..1: how similar each beat's SHAPE is to the
+// average beat.
+// How:
+//   1. Cut a window around every detected peak, from 30% of a typical
+//      interval before the peak to 50% after it.
+//   2. Average all windows into a template ("the typical beat").
+//   3. Correlate each beat with the template (1 = identical shape).
+//   4. SQI = average correlation.
+// Why: motion artifacts produce bumps that don't look like a pulse wave, so
+// they lower the SQI. Correlation ignores beat HEIGHT, so an irregular rhythm
+// whose beats differ in size but keep their shape is not penalized.
+// The window fractions (30% / 50%) are a design choice.
+export function beatShapeSQI(signal, peaks, sampleRateHz, medianIbiMs) {
+  if (peaks.length < 3 || !Number.isFinite(medianIbiMs)) return NaN;
+  const samplesPerMs = sampleRateHz / 1000;
+  const before = Math.round(0.3 * medianIbiMs * samplesPerMs);
+  const after = Math.round(0.5 * medianIbiMs * samplesPerMs);
+  const windows = [];
+  for (const p of peaks) {
+    if (p.index - before < 0 || p.index + after >= signal.length) continue;
+    const w = [];
+    for (let i = p.index - before; i <= p.index + after; i++) w.push(signal[i]);
+    windows.push(w);
+  }
+  if (windows.length < 3) return NaN;
+  const template = new Array(windows[0].length).fill(0);
+  for (const w of windows) {
+    for (let i = 0; i < w.length; i++) template[i] += w[i] / windows.length;
+  }
+  let total = 0;
+  for (const w of windows) total += correlation(w, template);
+  return total / windows.length;
+}
+
+// assessQuality(signal, peaks, ibiResult, frameTimings, options)
+//
+// What: decides whether a recording is trustworthy enough to classify.
+// Why:  hand or finger movement creates big, irregular bumps that look
+//       almost exactly like an irregular heart rhythm. Without this gate a
+//       shaky recording would be reported as "Irregular". So we check the
+//       recording BEFORE any verdict, and refuse to give one if it fails.
+//
+// Checks (each produces a readable reason when it fails):
+//   1. Enough beats:   at least 20 accepted intervals
+//   2. Few rejections: at most 20% of intervals rejected by filterIBIs
+//   3. Steady beat height: coefficient of variation (CV = SD / mean) of the
+//      detected peak amplitudes at most 0.5. Motion makes some "beats"
+//      many times taller than others.
+//   4. Steady camera: median frame interval <= 50 ms, interframe IQR
+//      <= 15 ms, and no gap over 500 ms.
+//
+// Parameters:
+//   signal       : filtered pulse signal (beats pointing up)
+//   peaks        : detectPeaks().peaks
+//   ibiResult    : filterIBIs() result
+//   frameTimings : the RAW frame timestamps in ms (before resampling)
+//   options      : { sampleRateHz } of `signal`, needed for the SQI
+//
+// Returns {
+//   pass        : true if every check passed
+//   reasons     : readable failure reasons (empty when pass is true)
+//   sqi         : beat-shape signal quality index, 0..1 (reported, not gated)
+//   checks      : every check with its value, limit and result (for the UI)
+//   frameStats  : frameTimingStats() output
+//   amplitudeCV : the beat-height CV
+// }
+export function assessQuality(signal, peaks, ibiResult, frameTimings, options) {
+  const L = QUALITY_LIMITS;
+  const sampleRateHz = (options && options.sampleRateHz) || DEFAULTS.RESAMPLE_HZ;
+  const checks = [];
+  const add = (name, value, limitText, pass, failText) => {
+    checks.push({ name: name, value: value, limitText: limitText, pass: pass, failText: failText });
+  };
+
+  // 1. Enough valid intervals.
+  const valid = ibiResult.kept.length;
+  add('Valid beat intervals', valid, '≥ ' + L.MIN_VALID_INTERVALS,
+      valid >= L.MIN_VALID_INTERVALS,
+      'Only ' + valid + ' valid beat intervals (need at least ' + L.MIN_VALID_INTERVALS + ').');
+
+  // 2. Rejection rate.
+  const rejectedFraction = ibiResult.total > 0 ? ibiResult.rejectedCount / ibiResult.total : 1;
+  add('Intervals rejected', rejectedFraction, '≤ ' + Math.round(L.MAX_REJECTED_FRACTION * 100) + '%',
+      rejectedFraction <= L.MAX_REJECTED_FRACTION,
+      Math.round(rejectedFraction * 100) + '% of beat intervals were implausible (limit ' +
+      Math.round(L.MAX_REJECTED_FRACTION * 100) + '%). Likely movement or poor finger contact.');
+
+  // 3. Beat height consistency (motion artifact).
+  const amplitudes = peaks.map((p) => p.amplitude);
+  const amplitudeCV = amplitudes.length >= 2 ? standardDeviation(amplitudes) / mean(amplitudes) : NaN;
+  add('Beat height variation (CV)', amplitudeCV, '≤ ' + L.MAX_AMPLITUDE_CV + ' (PROVISIONAL)',
+      Number.isFinite(amplitudeCV) && amplitudeCV <= L.MAX_AMPLITUDE_CV,
+      'Beat heights varied too much (CV ' + (Number.isFinite(amplitudeCV) ? amplitudeCV.toFixed(2) : 'n/a') +
+      '). This usually means the finger or phone moved.');
+
+  // 4. Camera frame timing.
+  const frameStats = frameTimingStats(frameTimings);
+  add('Median frame interval', frameStats.medianMs, '≤ ' + L.MAX_MEDIAN_FRAME_INTERVAL_MS + ' ms (PROVISIONAL)',
+      frameStats.medianMs <= L.MAX_MEDIAN_FRAME_INTERVAL_MS,
+      'Camera frame rate too low (median ' + frameStats.medianMs.toFixed(1) + ' ms between frames).');
+  add('Frame interval IQR', frameStats.iqrMs, '≤ ' + L.MAX_FRAME_INTERVAL_IQR_MS + ' ms (PROVISIONAL)',
+      frameStats.iqrMs <= L.MAX_FRAME_INTERVAL_IQR_MS,
+      'Camera frame timing too uneven (IQR ' + frameStats.iqrMs.toFixed(1) + ' ms).');
+  add('Longest frame gap', frameStats.maxGapMs, '≤ ' + L.MAX_FRAME_GAP_MS + ' ms (PROVISIONAL)',
+      frameStats.maxGapMs <= L.MAX_FRAME_GAP_MS,
+      'The camera paused for ' + Math.round(frameStats.maxGapMs) + ' ms during recording.');
+
+  const reasons = [];
+  for (const c of checks) {
+    if (!c.pass) reasons.push(c.failText);
+  }
+
+  const sqi = beatShapeSQI(signal, peaks, sampleRateHz, median(ibiResult.kept));
+
+  return {
+    pass: reasons.length === 0,
+    reasons: reasons,
+    sqi: sqi,
+    checks: checks,
+    frameStats: frameStats,
+    amplitudeCV: amplitudeCV,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // STAGE 8: CLASSIFY
 // ---------------------------------------------------------------------------
 
@@ -750,9 +936,12 @@ export function analyzeRecording(samples, options) {
   const metrics = computeMetrics(ibiResult.kept, ibiResult.keptIndices);
   const meanHR = metrics.meanHR;
 
-  // Stage 8: verdict. (The quality gate, stage 7, is added in P3; until
-  // then quality is null, meaning "not assessed".)
-  const quality = null;
+  // Stage 7: quality gate, BEFORE any verdict. Frame timing is judged on the
+  // raw camera timestamps, not the resampled grid.
+  const frameTimings = samples.map((s) => s.tMs);
+  const quality = assessQuality(filtered, peakResult.peaks, ibiResult, frameTimings, { sampleRateHz: fs });
+
+  // Stage 8: verdict (forced to "Insufficient" if the quality gate failed).
   const classification = classify(metrics, quality);
 
   // Time of each accepted interval (its ending beat), for the tachogram chart.

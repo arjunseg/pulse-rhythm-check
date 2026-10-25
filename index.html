@@ -208,6 +208,10 @@
       A "Regular" result does not rule out a heart condition. All thresholds are
       provisional and this app has not been validated against ECG.
     </p>
+
+    <h3>Signal quality check <span id="quality-badge" class="badge"></span></h3>
+    <div id="quality-list"></div>
+    <p class="small" id="sqi-line"></p>
     <p class="small" id="quality-note"></p>
 
     <div class="big-number"><span id="hr-value">–</span> <span class="unit">bpm average</span></div>
@@ -306,6 +310,9 @@ const verdictCard = document.getElementById('verdict-card');
 const verdictText = document.getElementById('verdict-text');
 const verdictDetail = document.getElementById('verdict-detail');
 const qualityNote = document.getElementById('quality-note');
+const qualityBadge = document.getElementById('quality-badge');
+const qualityList = document.getElementById('quality-list');
+const sqiLine = document.getElementById('sqi-line');
 const metricsList = document.getElementById('metrics-list');
 const tachoCanvas = document.getElementById('tacho-chart');
 const summaryTable = document.getElementById('capture-summary');
@@ -906,16 +913,80 @@ function formatMetric(key, value) {
 }
 
 // Verdict card at the top of the results.
-function renderVerdict(classification) {
+function renderVerdict(classification, quality) {
   verdictText.textContent = classification.verdict;
   let cls = 'insufficient';
   if (classification.verdict === dsp.VERDICTS.REGULAR) cls = 'regular';
   if (classification.verdict === dsp.VERDICTS.IRREGULAR) cls = 'irregular';
   verdictCard.className = 'verdict ' + cls;
-  verdictDetail.textContent =
-    classification.flagCount + ' of ' + classification.votingCount +
-    ' rhythm metrics exceeded their threshold (' + dsp.FLAGS_NEEDED_FOR_IRREGULAR +
-    ' needed for "Irregular": PROVISIONAL rule).';
+
+  verdictDetail.innerHTML = '';
+  if (quality && !quality.pass) {
+    // Quality failure: list the specific reasons instead of metric counts.
+    const intro = document.createElement('div');
+    intro.textContent = 'No rhythm result was produced because:';
+    const list = document.createElement('ul');
+    list.style.margin = '6px 0 0';
+    list.style.paddingLeft = '18px';
+    for (const reason of quality.reasons) {
+      const li = document.createElement('li');
+      li.textContent = reason;
+      list.appendChild(li);
+    }
+    verdictDetail.appendChild(intro);
+    verdictDetail.appendChild(list);
+  } else {
+    verdictDetail.textContent =
+      classification.flagCount + ' of ' + classification.votingCount +
+      ' rhythm metrics exceeded their threshold (' + dsp.FLAGS_NEEDED_FOR_IRREGULAR +
+      ' needed for "Irregular": PROVISIONAL rule).';
+  }
+}
+
+// Quality gate: one row per check with its measured value and limit.
+function renderQuality(quality) {
+  qualityBadge.textContent = quality.pass ? 'passed' : 'failed';
+  qualityBadge.className = 'badge ' + (quality.pass ? 'ok' : 'flagged');
+  qualityList.innerHTML = '';
+
+  for (const c of quality.checks) {
+    let valueText;
+    if (!Number.isFinite(c.value)) {
+      valueText = 'n/a';
+    } else if (c.name === 'Intervals rejected') {
+      valueText = (c.value * 100).toFixed(0) + '%';
+    } else if (c.name === 'Valid beat intervals') {
+      valueText = String(c.value);
+    } else if (c.name.indexOf('frame') !== -1 || c.name.indexOf('Frame') !== -1) {
+      valueText = c.value.toFixed(1) + ' ms';
+    } else {
+      valueText = c.value.toFixed(2);
+    }
+    const row = document.createElement('div');
+    row.className = 'metric';
+    const top = document.createElement('div');
+    top.className = 'metric-top';
+    const name = document.createElement('div');
+    name.className = 'metric-name';
+    name.textContent = (c.pass ? '✓ ' : '✗ ') + c.name;
+    name.style.color = c.pass ? 'var(--ok)' : 'var(--warn)';
+    const value = document.createElement('div');
+    value.className = 'metric-value';
+    value.textContent = valueText;
+    top.appendChild(name);
+    top.appendChild(value);
+    const rule = document.createElement('div');
+    rule.className = 'metric-rule';
+    rule.textContent = 'Limit: ' + c.limitText;
+    row.appendChild(top);
+    row.appendChild(rule);
+    qualityList.appendChild(row);
+  }
+
+  sqiLine.textContent = Number.isFinite(quality.sqi)
+    ? 'Beat-shape similarity (SQI): ' + quality.sqi.toFixed(2) +
+      ' (1.00 = every beat has the same shape). Reported for information; not part of the pass/fail decision.'
+    : '';
 }
 
 // One row per metric: value, threshold rule, flag, and citation placeholder.
@@ -1116,10 +1187,12 @@ function showResults() {
     ibiResult.kept.length + ' of ' + ibiResult.total + ' beat-to-beat intervals accepted · ' +
     ibiResult.rejectedCount + ' rejected as implausible.';
 
-  renderVerdict(analysis.classification);
-  qualityNote.textContent = analysis.quality
+  renderVerdict(analysis.classification, analysis.quality);
+  renderQuality(analysis.quality);
+  qualityNote.textContent = analysis.quality.pass
     ? ''
-    : 'Signal-quality check: not yet implemented in this build (stage P3).';
+    : 'The metrics below are shown for transparency only. They are not interpreted, ' +
+      'because the recording failed the signal-quality check.';
   renderMetrics(analysis.metrics, analysis.classification);
   drawTachogram(tachoCanvas, analysis.keptIbiTimesMs, ibiResult.kept, ibiResult.keptIndices);
 
@@ -1133,22 +1206,16 @@ function showResults() {
   drawSignalWithPeaks(resultCanvas, timesMs, analysis.filtered, analysis.threshold, peakPoints,
                       0, endMs);
 
-  // Frame-interval statistics (these move into dsp.assessQuality in P3).
-  const intervals = [];
-  for (let i = 1; i < samples.length; i++) {
-    intervals.push(samples[i].tMs - samples[i - 1].tMs);
-  }
-  intervals.sort((a, b) => a - b);
-  const pick = (q) => intervals.length ? intervals[Math.floor(q * (intervals.length - 1))] : NaN;
-  const medianInterval = pick(0.5);
-  const iqr = pick(0.75) - pick(0.25);
+  // Frame-timing numbers come from the quality gate (dsp.frameTimingStats).
+  const frameStats = analysis.quality.frameStats;
   const durationS = samples.length ? samples[samples.length - 1].tMs / 1000 : 0;
 
   const rows = [
     ['Frames recorded', samples.length],
     ['Duration', durationS.toFixed(1) + ' s'],
-    ['Median frame interval', medianInterval.toFixed(1) + ' ms (' + (1000 / medianInterval).toFixed(1) + ' fps)'],
-    ['Frame interval IQR', iqr.toFixed(1) + ' ms'],
+    ['Median frame interval', frameStats.medianMs.toFixed(1) + ' ms (' + (1000 / frameStats.medianMs).toFixed(1) + ' fps)'],
+    ['Frame interval IQR', frameStats.iqrMs.toFixed(1) + ' ms'],
+    ['Longest frame gap', frameStats.maxGapMs.toFixed(0) + ' ms'],
     ['Timestamp source', timestampSource],
     ['Frames without finger', recordStats ? recordStats.noFingerFrames : 0],
     ['Clipped (too bright) frames', recordStats ? recordStats.saturatedFrames : 0],
