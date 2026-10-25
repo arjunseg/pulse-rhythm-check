@@ -216,6 +216,7 @@ const CONFIG = {
   FINGER_MIN_RED: 30,        // 0..255 scale
   FINGER_RED_TO_GREEN: 1.4,  // red must be at least 1.4x green
   SATURATION_RED: 250,       // red average at or above this is treated as clipped
+  SATURATION_PIXEL: 254,     // an individual pixel at or above this counts as saturated
 };
 
 // ---------------------------------------------------------------------------
@@ -369,13 +370,24 @@ async function startCamera() {
 // automatic adjustment has adapted to the finger. If white balance stays
 // automatic, the camera keeps re-balancing colour and can cancel out the
 // tiny brightness changes we are trying to measure.
+//
+// Preferred mode is 'manual' (hold current settings). If the camera doesn't
+// offer it, 'single-shot' is the next best: the camera adjusts ONCE and then
+// holds that setting, which for our purpose also acts as a lock.
 async function lockExposureAndWhiteBalance() {
   const caps = getCapabilitiesSafe();
-  if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual')) {
-    cameraInfo.exposureLocked = await tryAdvancedConstraint('exposureMode', 'manual');
-  }
-  if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
-    cameraInfo.whiteBalanceLocked = await tryAdvancedConstraint('whiteBalanceMode', 'manual');
+  const exposureModes = Array.isArray(caps.exposureMode) ? caps.exposureMode : [];
+  const wbModes = Array.isArray(caps.whiteBalanceMode) ? caps.whiteBalanceMode : [];
+  cameraInfo.exposureModesOffered = exposureModes.join(', ') || 'none reported';
+  cameraInfo.whiteBalanceModesOffered = wbModes.join(', ') || 'none reported';
+
+  for (const mode of ['manual', 'single-shot']) {
+    if (!cameraInfo.exposureLocked && exposureModes.includes(mode)) {
+      if (await tryAdvancedConstraint('exposureMode', mode)) cameraInfo.exposureLocked = mode;
+    }
+    if (!cameraInfo.whiteBalanceLocked && wbModes.includes(mode)) {
+      if (await tryAdvancedConstraint('whiteBalanceMode', mode)) cameraInfo.whiteBalanceLocked = mode;
+    }
   }
   if (!cameraInfo.exposureLocked || !cameraInfo.whiteBalanceLocked) {
     addNotice('This camera does not let us lock exposure/white balance. ' +
@@ -461,13 +473,17 @@ function readFrameColor() {
   let sumR = 0;
   let sumG = 0;
   let sumB = 0;
+  let saturatedR = 0; // pixels whose red value is at (or next to) the 255 maximum
   for (let i = 0; i < pixels.length; i += 4) {
     sumR += pixels[i];
     sumG += pixels[i + 1];
     sumB += pixels[i + 2];
+    if (pixels[i] >= CONFIG.SATURATION_PIXEL) saturatedR += 1;
   }
   const count = pixels.length / 4;
-  return { r: sumR / count, g: sumG / count, b: sumB / count };
+  // satFraction matters because a saturated pixel can't get any brighter or
+  // show the pulse: the average can look fine while many pixels are clipped.
+  return { r: sumR / count, g: sumG / count, b: sumB / count, satFraction: saturatedR / count };
 }
 
 function isFingerPresent(color) {
@@ -538,12 +554,19 @@ function handleSettleFrame(tMs, dtMs, finger) {
 function handleRecordFrame(tMs, color, finger) {
   if (recordStartMs === null) {
     recordStartMs = tMs;
-    recordStats = { noFingerFrames: 0, saturatedFrames: 0, totalFrames: 0 };
+    recordStats = { noFingerFrames: 0, saturatedFrames: 0, totalFrames: 0,
+                    sumR: 0, sumG: 0, sumB: 0, sumSatFraction: 0 };
   }
   const relMs = tMs - recordStartMs;
-  samples.push({ tMs: relMs, value: color.r });
+  // value = red channel (what the pipeline analyses). Green, blue and the
+  // saturated-pixel fraction are kept for diagnostics and the CSV export.
+  samples.push({ tMs: relMs, value: color.r, g: color.g, b: color.b, sat: color.satFraction });
 
   recordStats.totalFrames += 1;
+  recordStats.sumR += color.r;
+  recordStats.sumG += color.g;
+  recordStats.sumB += color.b;
+  recordStats.sumSatFraction += color.satFraction;
   if (!finger) recordStats.noFingerFrames += 1;
   if (color.r >= CONFIG.SATURATION_RED) recordStats.saturatedFrames += 1;
 
@@ -856,9 +879,19 @@ function showResults() {
     ['Timestamp source', timestampSource],
     ['Frames without finger', recordStats ? recordStats.noFingerFrames : 0],
     ['Clipped (too bright) frames', recordStats ? recordStats.saturatedFrames : 0],
+    ['Mean red / green / blue', recordStats
+      ? (recordStats.sumR / recordStats.totalFrames).toFixed(1) + ' / ' +
+        (recordStats.sumG / recordStats.totalFrames).toFixed(1) + ' / ' +
+        (recordStats.sumB / recordStats.totalFrames).toFixed(1)
+      : '–'],
+    ['Red pixels saturated (avg)', recordStats
+      ? (100 * recordStats.sumSatFraction / recordStats.totalFrames).toFixed(1) + ' %'
+      : '–'],
     ['Torch', cameraInfo.torch ? 'on' : 'unavailable'],
-    ['Exposure locked', cameraInfo.exposureLocked ? 'yes' : 'no'],
-    ['White balance locked', cameraInfo.whiteBalanceLocked ? 'yes' : 'no'],
+    ['Exposure locked', cameraInfo.exposureLocked ? 'yes (' + cameraInfo.exposureLocked + ')' : 'no'],
+    ['White balance locked', cameraInfo.whiteBalanceLocked ? 'yes (' + cameraInfo.whiteBalanceLocked + ')' : 'no'],
+    ['Exposure modes offered', cameraInfo.exposureModesOffered || '–'],
+    ['White balance modes offered', cameraInfo.whiteBalanceModesOffered || '–'],
     ['Camera', cameraInfo.label + ' (' + cameraInfo.width + 'x' + cameraInfo.height + ')'],
   ];
   summaryTable.innerHTML = '';
@@ -877,9 +910,10 @@ function showResults() {
 // Save the raw {tMs, value} samples as a CSV file, so a recording can be
 // inspected or re-analysed later without re-recording.
 function downloadCsv() {
-  let text = 'tMs,red\n';
+  let text = 'tMs,red,green,blue,redSaturatedFraction\n';
   for (const s of samples) {
-    text += s.tMs.toFixed(3) + ',' + s.value.toFixed(4) + '\n';
+    text += s.tMs.toFixed(3) + ',' + s.value.toFixed(4) + ',' + s.g.toFixed(4) + ',' +
+            s.b.toFixed(4) + ',' + s.sat.toFixed(4) + '\n';
   }
   const blob = new Blob([text], { type: 'text/csv' });
   const link = document.createElement('a');
