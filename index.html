@@ -100,6 +100,44 @@
   h3 { font-size: 1rem; margin: 20px 0 4px; }
   .big-number { font-size: 3rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
   .big-number .unit { font-size: 1rem; font-weight: 400; color: var(--muted); }
+  .verdict {
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 8px 0;
+    border: 2px solid var(--line);
+    background: var(--panel);
+  }
+  .verdict.regular { border-color: var(--ok); }
+  .verdict.irregular { border-color: var(--warn); }
+  .verdict.insufficient { border-color: var(--muted); }
+  .verdict-label { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .verdict-text { font-size: 1.4rem; font-weight: 700; margin: 4px 0; }
+  .verdict.regular .verdict-text { color: var(--ok); }
+  .verdict.irregular .verdict-text { color: var(--warn); }
+  .verdict-detail { font-size: 0.9rem; color: var(--muted); }
+  .metric {
+    border-bottom: 1px solid var(--line);
+    padding: 10px 0;
+  }
+  .metric-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .metric-name { font-weight: 600; }
+  .metric-value { font-size: 1.15rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .metric-rule { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+  .metric-source { font-size: 0.8rem; color: var(--warn); margin-top: 2px; }
+  .badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .badge.flagged { border-color: var(--warn); color: var(--warn); }
+  .badge.ok { border-color: var(--ok); color: var(--ok); }
+  .badge.provisional { border-color: var(--accent); color: var(--accent); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -160,8 +198,30 @@
   <!-- ===================== RESULTS SCREEN ===================== -->
   <section id="screen-results" hidden>
     <h2>Results</h2>
+
+    <div id="verdict-card" class="verdict">
+      <div class="verdict-label">Rhythm screening result</div>
+      <div id="verdict-text" class="verdict-text">–</div>
+      <div id="verdict-detail" class="verdict-detail"></div>
+    </div>
+    <p class="small">
+      A "Regular" result does not rule out a heart condition. All thresholds are
+      provisional and this app has not been validated against ECG.
+    </p>
+    <p class="small" id="quality-note"></p>
+
     <div class="big-number"><span id="hr-value">–</span> <span class="unit">bpm average</span></div>
     <p class="small" id="beat-summary"></p>
+
+    <h3>Rhythm metrics</h3>
+    <div id="metrics-list"></div>
+
+    <h3>Beat-to-beat intervals</h3>
+    <canvas id="tacho-chart" class="wave"></canvas>
+    <p class="small">
+      Each dot is the time between two heartbeats. A steady rhythm gives a flat
+      band of dots; an irregular rhythm scatters them up and down.
+    </p>
 
     <h3>Detected beats: 10-second close-up</h3>
     <canvas id="zoom-wave" class="wave"></canvas>
@@ -242,6 +302,12 @@ const zoomCanvas = document.getElementById('zoom-wave');
 const hrValue = document.getElementById('hr-value');
 const beatSummary = document.getElementById('beat-summary');
 const btnDownload = document.getElementById('btn-download');
+const verdictCard = document.getElementById('verdict-card');
+const verdictText = document.getElementById('verdict-text');
+const verdictDetail = document.getElementById('verdict-detail');
+const qualityNote = document.getElementById('quality-note');
+const metricsList = document.getElementById('metrics-list');
+const tachoCanvas = document.getElementById('tacho-chart');
 const summaryTable = document.getElementById('capture-summary');
 const landingError = document.getElementById('landing-error');
 const btnStart = document.getElementById('btn-start');
@@ -763,6 +829,163 @@ function drawSignalWithPeaks(canvas, timesMs, values, threshold, peaks, tStartMs
   }
 }
 
+// Tachogram: inter-beat interval (ms) plotted against time (s).
+//   timesMs         : time of each interval (its ending beat)
+//   ibis            : interval lengths in ms
+//   originalIndices : position in the unfiltered series; lines are drawn only
+//                     between truly consecutive intervals (gaps stay gaps)
+// The vertical axis always spans at least 400 ms, so tiny normal jitter
+// isn't stretched to fill the chart and made to look dramatic.
+function drawTachogram(canvas, timesMs, ibis, originalIndices) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  if (ibis.length === 0) return;
+
+  const leftAxis = 44;
+  const bottomAxis = 18;
+  const plotW = width - leftAxis - 8;
+  const plotH = height - bottomAxis - 10;
+
+  let lo = Math.min(...ibis);
+  let hi = Math.max(...ibis);
+  const minSpan = 400;
+  if (hi - lo < minSpan) {
+    const mid = (hi + lo) / 2;
+    lo = mid - minSpan / 2;
+    hi = mid + minSpan / 2;
+  }
+  lo = Math.floor(lo / 100) * 100;
+  hi = Math.ceil(hi / 100) * 100;
+  const tEnd = Math.max(...timesMs);
+  const xOf = (t) => leftAxis + (t / tEnd) * plotW;
+  const yOf = (v) => 10 + (1 - (v - lo) / (hi - lo)) * plotH;
+
+  // Horizontal grid with ms labels every 100 or 200 ms.
+  const step = (hi - lo) > 800 ? 200 : 100;
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.fillStyle = '#9aa4b2';
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.textAlign = 'right';
+  for (let v = lo; v <= hi; v += step) {
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(leftAxis, y);
+    ctx.lineTo(width - 8, y);
+    ctx.stroke();
+    ctx.fillText(v + ' ms', leftAxis - 4, y + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let s = 0; s <= tEnd / 1000; s += 10) {
+    ctx.fillText(s + 's', xOf(s * 1000), height - 4);
+  }
+
+  // Lines between consecutive intervals, then dots.
+  ctx.strokeStyle = 'rgba(255,77,94,0.5)';
+  ctx.lineWidth = 1.5;
+  for (let k = 0; k + 1 < ibis.length; k++) {
+    if (originalIndices[k + 1] !== originalIndices[k] + 1) continue;
+    ctx.beginPath();
+    ctx.moveTo(xOf(timesMs[k]), yOf(ibis[k]));
+    ctx.lineTo(xOf(timesMs[k + 1]), yOf(ibis[k + 1]));
+    ctx.stroke();
+  }
+  ctx.fillStyle = '#ff4d5e';
+  for (let k = 0; k < ibis.length; k++) {
+    ctx.beginPath();
+    ctx.arc(xOf(timesMs[k]), yOf(ibis[k]), 3, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+// Format a metric value for display.
+function formatMetric(key, value) {
+  if (value === null || !Number.isFinite(value)) return 'n/a';
+  if (key === 'rmssd') return value.toFixed(1) + ' ms';
+  if (key === 'pnn50') return value.toFixed(1) + ' %';
+  return value.toFixed(3);
+}
+
+// Verdict card at the top of the results.
+function renderVerdict(classification) {
+  verdictText.textContent = classification.verdict;
+  let cls = 'insufficient';
+  if (classification.verdict === dsp.VERDICTS.REGULAR) cls = 'regular';
+  if (classification.verdict === dsp.VERDICTS.IRREGULAR) cls = 'irregular';
+  verdictCard.className = 'verdict ' + cls;
+  verdictDetail.textContent =
+    classification.flagCount + ' of ' + classification.votingCount +
+    ' rhythm metrics exceeded their threshold (' + dsp.FLAGS_NEEDED_FOR_IRREGULAR +
+    ' needed for "Irregular": PROVISIONAL rule).';
+}
+
+// One row per metric: value, threshold rule, flag, and citation placeholder.
+function renderMetrics(metrics, classification) {
+  metricsList.innerHTML = '';
+
+  const addRow = (name, valueText, badgeText, badgeClass, ruleText, sourceText) => {
+    const row = document.createElement('div');
+    row.className = 'metric';
+    const top = document.createElement('div');
+    top.className = 'metric-top';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'metric-name';
+    nameEl.textContent = name;
+    if (badgeText) {
+      const badge = document.createElement('span');
+      badge.className = 'badge ' + badgeClass;
+      badge.textContent = badgeText;
+      nameEl.appendChild(badge);
+    }
+    const valueEl = document.createElement('div');
+    valueEl.className = 'metric-value';
+    valueEl.textContent = valueText;
+    top.appendChild(nameEl);
+    top.appendChild(valueEl);
+    row.appendChild(top);
+    if (ruleText) {
+      const rule = document.createElement('div');
+      rule.className = 'metric-rule';
+      rule.textContent = ruleText;
+      row.appendChild(rule);
+    }
+    if (sourceText) {
+      const src = document.createElement('div');
+      src.className = 'metric-source';
+      src.textContent = sourceText;
+      row.appendChild(src);
+    }
+    metricsList.appendChild(row);
+  };
+
+  // Mean heart rate: shown for context, not part of the rhythm verdict.
+  const hrText = Number.isFinite(metrics.meanHR) ? metrics.meanHR.toFixed(0) + ' bpm' : 'n/a';
+  addRow('Mean heart rate', hrText, 'info only', '', 'Not used in the verdict.', '');
+
+  for (const key of Object.keys(dsp.THRESHOLDS)) {
+    const f = classification.perMetricFlags[key];
+    const t = f.threshold;
+    let badgeText;
+    let badgeClass;
+    if (!f.votes) {
+      badgeText = 'not used';
+      badgeClass = '';
+    } else if (f.flagged) {
+      badgeText = 'flagged';
+      badgeClass = 'flagged';
+    } else {
+      badgeText = 'within threshold';
+      badgeClass = 'ok';
+    }
+    let rule = 'Flag if ' + (t.direction === 'above' ? '>' : '<') + ' ' + t.value + (t.unit ? ' ' + t.unit : '');
+    if (t.provisional) rule += ' (PROVISIONAL)';
+    if (f.note) rule += ' · ' + f.note;
+    addRow(t.label, formatMetric(key, f.value), badgeText, badgeClass, rule, t.source);
+  }
+
+  addRow('Intervals analysed', String(metrics.beatCount), '', '',
+         metrics.diffCount + ' successive differences', '');
+}
+
 // Live waveform. For DISPLAY ONLY we:
 //   1. invert the signal: more blood in the fingertip absorbs more light, so
 //      the raw brightness DIPS at each heartbeat; flipping it makes beats point up.
@@ -891,8 +1114,14 @@ function showResults() {
   beatSummary.textContent =
     analysis.peaks.length + ' beats detected · ' +
     ibiResult.kept.length + ' of ' + ibiResult.total + ' beat-to-beat intervals accepted · ' +
-    ibiResult.rejectedCount + ' rejected as implausible. ' +
-    'Rhythm metrics and signal-quality check come in the next build stages.';
+    ibiResult.rejectedCount + ' rejected as implausible.';
+
+  renderVerdict(analysis.classification);
+  qualityNote.textContent = analysis.quality
+    ? ''
+    : 'Signal-quality check: not yet implemented in this build (stage P3).';
+  renderMetrics(analysis.metrics, analysis.classification);
+  drawTachogram(tachoCanvas, analysis.keptIbiTimesMs, ibiResult.kept, ibiResult.keptIndices);
 
   // Charts: a 10 s close-up from the middle of the recording, then all 45 s.
   const timesMs = analysis.resampled.timesMs;

@@ -395,7 +395,7 @@ export function filterIBIs(ibis, options) {
 }
 
 // ---------------------------------------------------------------------------
-// STAGE 6: METRICS (P1 provides mean heart rate; the rest arrive in P2)
+// STAGE 6: METRICS
 // ---------------------------------------------------------------------------
 
 // meanHeartRateBpm(ibis)
@@ -406,6 +406,304 @@ export function filterIBIs(ibis, options) {
 export function meanHeartRateBpm(ibis) {
   if (ibis.length === 0) return NaN;
   return 60000 / mean(ibis);
+}
+
+// Sample standard deviation (divides by n - 1).
+export function standardDeviation(values) {
+  if (values.length < 2) return NaN;
+  const m = mean(values);
+  let sumSq = 0;
+  for (const v of values) sumSq += (v - m) * (v - m);
+  return Math.sqrt(sumSq / (values.length - 1));
+}
+
+// successiveDifferences(ibis, originalIndices)
+//
+// What: the change from each interval to the next: d[k] = IBI[k+1] - IBI[k], in ms.
+// Why the second parameter: if an interval was rejected by filterIBIs, the
+// intervals on either side of the gap were NOT consecutive heartbeats.
+// Subtracting them would invent a jump that never happened. So we only take
+// a difference when the two intervals were neighbors in the original series.
+//   originalIndices : keptIndices from filterIBIs. If omitted, every pair of
+//                     neighbors is used (fine for an unfiltered series).
+export function successiveDifferences(ibis, originalIndices) {
+  const diffs = [];
+  for (let k = 0; k + 1 < ibis.length; k++) {
+    const adjacent = !originalIndices || originalIndices[k + 1] === originalIndices[k] + 1;
+    if (adjacent) diffs.push(ibis[k + 1] - ibis[k]);
+  }
+  return diffs;
+}
+
+// rmssd(diffs)
+//
+// Root Mean Square of Successive Differences, in ms:
+//   RMSSD = sqrt( mean( d[k]^2 ) )
+// Squares each beat-to-beat change, averages them, takes the square root.
+// A steady rhythm gives small values; an erratic one gives large values.
+export function rmssd(diffs) {
+  if (diffs.length === 0) return NaN;
+  let sumSq = 0;
+  for (const d of diffs) sumSq += d * d;
+  return Math.sqrt(sumSq / diffs.length);
+}
+
+// pnn50(diffs)
+//
+// Percentage of successive differences larger than 50 ms (in either direction):
+//   pNN50 = 100 x (number of |d[k]| > 50 ms) / (number of differences)
+export function pnn50(diffs) {
+  if (diffs.length === 0) return NaN;
+  let count = 0;
+  for (const d of diffs) {
+    if (Math.abs(d) > 50) count += 1;
+  }
+  return (100 * count) / diffs.length;
+}
+
+// shannonEntropyOfDiffs(diffs, binCount, rangeMs)
+//
+// What: how spread out the beat-to-beat changes are, on a 0..1 scale.
+// How:
+//   1. Make a histogram of the differences with 16 equal bins covering
+//      -300 ms to +300 ms (each bin is 37.5 ms wide).
+//      Differences beyond +/-300 ms are counted in the outermost bin
+//      (a design choice: dropping them would hide the most irregular beats).
+//   2. Turn counts into proportions p (they add up to 1).
+//   3. Shannon entropy H = -sum( p x ln(p) ), skipping empty bins.
+//   4. Divide by ln(16), the largest possible value, so the result is 0..1.
+// Interpretation: 0 = every difference fell in the same bin (very steady);
+// 1 = differences spread evenly over all bins (very erratic).
+// Unlike sample entropy, this uses FIXED bin widths in ms, so it responds
+// to how BIG the changes are, not only how unpredictable they are.
+export function shannonEntropyOfDiffs(diffs, binCount, rangeMs) {
+  const bins = binCount || 16;
+  const range = rangeMs || 300;
+  if (diffs.length === 0) return NaN;
+  const counts = new Array(bins).fill(0);
+  const binWidth = (2 * range) / bins;
+  for (const d of diffs) {
+    let b = Math.floor((d + range) / binWidth);
+    if (b < 0) b = 0;
+    if (b > bins - 1) b = bins - 1;
+    counts[b] += 1;
+  }
+  let h = 0;
+  for (const c of counts) {
+    if (c === 0) continue;
+    const p = c / diffs.length;
+    h -= p * Math.log(p);
+  }
+  return h / Math.log(bins);
+}
+
+// sampleEntropy(series, m, rFraction)
+//
+// What: how UNPREDICTABLE the interval series is (Richman & Moorman's
+//       sample entropy, "SampEn").
+// How, in plain words:
+//   * Take every run of m = 2 consecutive intervals (a "template").
+//   * Count pairs of templates that match: every element within r of the
+//     other, where r = 0.2 x the standard deviation of the series. Call the
+//     number of matching pairs B.
+//   * Do the same for runs of m + 1 = 3 intervals. Call that A.
+//   * SampEn = -ln(A / B).
+//   If patterns that match for 2 beats usually still match for a 3rd beat,
+//   A is close to B and SampEn is low (predictable). If they usually
+//   diverge, SampEn is high (unpredictable).
+// Details:
+//   * A template is never compared with itself.
+//   * Both counts use the same N - m starting positions, so A and B are
+//     comparable (standard practice).
+//   * If A or B is zero, SampEn is undefined and null is returned.
+// IMPORTANT: because r is 0.2 x SD, SampEn ignores how LARGE the variation
+//   is: tiny random jitter and huge random variation give similar values.
+//   It measures predictability, not size.
+// Reliability: with few intervals, A and B are small counts and SampEn
+//   jumps around. computeMetrics() flags it as low-confidence below 50.
+export function sampleEntropy(series, m, rFraction) {
+  const n = series.length;
+  const sd = standardDeviation(series);
+  if (n < m + 2 || !(sd > 0)) return null;
+  const r = rFraction * sd;
+
+  let matchesM = 0;       // B
+  let matchesMPlus1 = 0;  // A
+  const starts = n - m;   // same starting positions for both template lengths
+  for (let i = 0; i < starts; i++) {
+    for (let j = i + 1; j < starts; j++) {
+      // Do the first m elements match (Chebyshev distance <= r)?
+      let match = true;
+      for (let k = 0; k < m; k++) {
+        if (Math.abs(series[i + k] - series[j + k]) > r) {
+          match = false;
+          break;
+        }
+      }
+      if (!match) continue;
+      matchesM += 1;
+      // Does the match extend to element m (length m + 1)?
+      if (Math.abs(series[i + m] - series[j + m]) <= r) {
+        matchesMPlus1 += 1;
+      }
+    }
+  }
+  if (matchesM === 0 || matchesMPlus1 === 0) return null;
+  return -Math.log(matchesMPlus1 / matchesM);
+}
+
+// Below this many intervals, sample entropy is reported as low-confidence.
+export const SAMPLE_ENTROPY_MIN_INTERVALS = 50;
+
+// computeMetrics(ibis, originalIndices)
+//
+// Computes every rhythm metric from the ACCEPTED intervals.
+//   ibis            : accepted inter-beat intervals in ms (filterIBIs().kept)
+//   originalIndices : filterIBIs().keptIndices, so successive differences
+//                     are never taken across a rejected interval
+//
+// Returns {
+//   meanHR          : bpm
+//   rmssd           : ms
+//   pnn50           : percent (0..100)
+//   shannonEntropy  : 0..1
+//   sampleEntropy   : unitless, or null if undefined
+//   sampleEntropyLowConfidence : true if fewer than 50 intervals
+//   beatCount       : number of accepted inter-beat intervals
+//   diffCount       : number of successive differences used
+// }
+export function computeMetrics(ibis, originalIndices) {
+  const diffs = successiveDifferences(ibis, originalIndices);
+  return {
+    meanHR: meanHeartRateBpm(ibis),
+    rmssd: rmssd(diffs),
+    pnn50: pnn50(diffs),
+    shannonEntropy: shannonEntropyOfDiffs(diffs, 16, 300),
+    sampleEntropy: sampleEntropy(ibis, 2, 0.2),
+    sampleEntropyLowConfidence: ibis.length < SAMPLE_ENTROPY_MIN_INTERVALS,
+    beatCount: ibis.length,
+    diffCount: diffs.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 8: CLASSIFY
+// ---------------------------------------------------------------------------
+
+// Decision thresholds.
+//
+// *** EVERY VALUE BELOW IS PROVISIONAL. ***
+// They are round placeholder numbers chosen by the developer so the code
+// runs. They are NOT taken from any paper. Each must be replaced with a
+// value from a published source, and the source written into `source`
+// (shown in the UI next to the threshold).
+export const THRESHOLDS = Object.freeze({
+  rmssd: Object.freeze({
+    label: 'RMSSD',
+    unit: 'ms',
+    value: 100,            // PROVISIONAL placeholder
+    direction: 'above',    // flagged when the metric is ABOVE value
+    provisional: true,
+    source: '[THRESHOLD SOURCE — fill in citation]',
+  }),
+  pnn50: Object.freeze({
+    label: 'pNN50',
+    unit: '%',
+    value: 50,             // PROVISIONAL placeholder
+    direction: 'above',
+    provisional: true,
+    source: '[THRESHOLD SOURCE — fill in citation]',
+  }),
+  shannonEntropy: Object.freeze({
+    label: 'Shannon entropy (ΔIBI)',
+    unit: '',
+    value: 0.7,            // PROVISIONAL placeholder
+    direction: 'above',
+    provisional: true,
+    source: '[THRESHOLD SOURCE — fill in citation]',
+  }),
+  sampleEntropy: Object.freeze({
+    label: 'Sample entropy',
+    unit: '',
+    value: 1.5,            // PROVISIONAL placeholder
+    direction: 'above',
+    provisional: true,
+    source: '[THRESHOLD SOURCE — fill in citation]',
+  }),
+});
+
+// How many metric flags are needed to call the rhythm irregular.
+// PROVISIONAL design choice (not from a paper): requiring agreement between
+// at least 2 metrics means one noisy metric can't produce "Irregular" alone.
+export const FLAGS_NEEDED_FOR_IRREGULAR = 2;
+
+export const VERDICTS = Object.freeze({
+  REGULAR: 'Regular',
+  IRREGULAR: 'Irregular — suggest clinical evaluation',
+  INSUFFICIENT: 'Insufficient signal quality — please retry',
+});
+
+// classify(metrics, quality)
+//
+// What: turns the metrics into one of three verdicts using fixed thresholds.
+// Steps:
+//   1. If the quality gate failed, stop: verdict is "Insufficient signal
+//      quality". A noisy recording must never be labelled regular or irregular.
+//   2. Compare each rhythm metric with its threshold and record a flag.
+//      Sample entropy only VOTES when it is high-confidence (>= 50 intervals)
+//      and defined; otherwise it is shown but excluded from the vote.
+//   3. If at least FLAGS_NEEDED_FOR_IRREGULAR voting metrics are flagged,
+//      the verdict is "Irregular"; otherwise "Regular".
+//
+// Parameters:
+//   metrics : output of computeMetrics()
+//   quality : output of assessQuality(), or null if not assessed
+//
+// Returns {
+//   verdict        : one of VERDICTS
+//   perMetricFlags : { key: { value, threshold, flagged, votes, note } }
+//   flagCount      : number of voting metrics flagged
+//   votingCount    : number of metrics that voted
+// }
+export function classify(metrics, quality) {
+  const perMetricFlags = {};
+  let flagCount = 0;
+  let votingCount = 0;
+
+  for (const key of Object.keys(THRESHOLDS)) {
+    const t = THRESHOLDS[key];
+    const value = metrics[key];
+    const defined = value !== null && Number.isFinite(value);
+    const flagged = defined && (t.direction === 'above' ? value > t.value : value < t.value);
+
+    let votes = defined;
+    let note = '';
+    if (!defined) {
+      note = 'could not be computed';
+    } else if (key === 'sampleEntropy' && metrics.sampleEntropyLowConfidence) {
+      votes = false;
+      note = 'low confidence (fewer than ' + SAMPLE_ENTROPY_MIN_INTERVALS + ' intervals): not used in verdict';
+    }
+
+    if (votes) {
+      votingCount += 1;
+      if (flagged) flagCount += 1;
+    }
+    perMetricFlags[key] = { value: value, threshold: t, flagged: flagged, votes: votes, note: note };
+  }
+
+  let verdict;
+  if (quality && quality.pass === false) {
+    verdict = VERDICTS.INSUFFICIENT;
+  } else if (votingCount < FLAGS_NEEDED_FOR_IRREGULAR) {
+    verdict = VERDICTS.INSUFFICIENT; // not enough usable metrics to decide
+  } else if (flagCount >= FLAGS_NEEDED_FOR_IRREGULAR) {
+    verdict = VERDICTS.IRREGULAR;
+  } else {
+    verdict = VERDICTS.REGULAR;
+  }
+
+  return { verdict: verdict, perMetricFlags: perMetricFlags, flagCount: flagCount, votingCount: votingCount };
 }
 
 // ---------------------------------------------------------------------------
@@ -448,10 +746,23 @@ export function analyzeRecording(samples, options) {
   const ibis = peaksToIBIs(peakTimesMs);
   const ibiResult = filterIBIs(ibis, opts);
 
-  // Stage 6 (P1 subset): mean heart rate from accepted intervals only.
-  const meanHR = meanHeartRateBpm(ibiResult.kept);
+  // Stage 6: metrics from accepted intervals only.
+  const metrics = computeMetrics(ibiResult.kept, ibiResult.keptIndices);
+  const meanHR = metrics.meanHR;
+
+  // Stage 8: verdict. (The quality gate, stage 7, is added in P3; until
+  // then quality is null, meaning "not assessed".)
+  const quality = null;
+  const classification = classify(metrics, quality);
+
+  // Time of each accepted interval (its ending beat), for the tachogram chart.
+  const keptIbiTimesMs = ibiResult.keptIndices.map((i) => peakTimesMs[i + 1]);
 
   return {
+    metrics: metrics,
+    quality: quality,
+    classification: classification,
+    keptIbiTimesMs: keptIbiTimesMs,
     resampled: resampled,
     filtered: filtered,
     threshold: peakResult.threshold,
