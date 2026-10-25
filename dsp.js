@@ -1,0 +1,464 @@
+// ============================================================================
+// dsp.js: pure signal-processing functions for the pulse rhythm app.
+//
+// Rules for this file:
+//   * No DOM access, no browser APIs, no mutable global state.
+//   * Every function takes plain numbers/arrays and returns new values.
+//   * index.html (live camera) and validate.html (synthetic test signals)
+//     both call analyzeRecording() below, so the validation page tests the
+//     EXACT code path used on real recordings.
+//
+// Units used throughout: time in milliseconds (ms), frequency in hertz (Hz),
+// heart rate in beats per minute (bpm).
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Default parameters. These are DESIGN CHOICES for this app, not published
+// clinical thresholds. Each one is explained where it is used.
+// ---------------------------------------------------------------------------
+export const DEFAULTS = Object.freeze({
+  RESAMPLE_HZ: 30,                    // uniform analysis grid (camera runs at ~30 fps)
+  DETREND_SECONDS: 1.5,               // baseline-removal window
+  SMOOTH_SAMPLES: 5,                  // noise-smoothing window (5 samples = 167 ms at 30 Hz)
+  PEAK_RMS_WINDOW_SECONDS: 3,         // window for the adaptive peak threshold
+  PEAK_THRESHOLD_RMS_MULTIPLIER: 0.5, // a peak must exceed 0.5 x local RMS
+  REFRACTORY_MS: 300,                 // two beats can't be closer than 300 ms (200 bpm)
+  IBI_MIN_MS: 300,                    // plausible inter-beat interval range:
+  IBI_MAX_MS: 2000,                   //   300 ms (200 bpm) to 2000 ms (30 bpm)
+  IBI_NEIGHBOR_COUNT: 2,              // compare each interval to 2 neighbors on each side
+  IBI_MAX_DEVIATION_FRACTION: 0.5,    // reject if >50% away from the neighbors' median
+});
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Median of an array of numbers (does not modify the input).
+export function median(values) {
+  if (values.length === 0) return NaN;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid];
+  return (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Arithmetic mean.
+export function mean(values) {
+  if (values.length === 0) return NaN;
+  let sum = 0;
+  for (const v of values) sum += v;
+  return sum / values.length;
+}
+
+// Centered moving average. Each output sample is the average of the input
+// samples from (i - half) to (i + half). Near the ends of the signal the
+// window shrinks to whatever samples exist, so the output has the same
+// length as the input and no artificial zero-padding.
+//
+// windowSamples is rounded UP to an odd number so the window is symmetric
+// around each sample (an even window can't be centered).
+//
+// Uses a running-sum ("prefix sum") so the cost is O(n) regardless of window.
+function centeredMovingAverage(signal, windowSamples) {
+  const n = signal.length;
+  const half = Math.floor(windowSamples / 2);
+  const prefix = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    prefix[i + 1] = prefix[i] + signal[i];
+  }
+  const out = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const lo = Math.max(0, i - half);
+    const hi = Math.min(n - 1, i + half);
+    out[i] = (prefix[hi + 1] - prefix[lo]) / (hi - lo + 1);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 2: RESAMPLE
+// ---------------------------------------------------------------------------
+
+// resampleUniform(samples, targetHz)
+//
+// What: converts irregularly timed camera samples into evenly spaced samples.
+// Why:  the camera does not deliver frames at exactly 30 fps; intervals jitter
+//       by a few ms and frames are occasionally dropped. Every filter below
+//       assumes "sample i+1 is exactly 1/30 s after sample i", so we first
+//       rebuild the signal on a uniform time grid using straight-line
+//       (linear) interpolation between the two real samples around each
+//       grid point.
+//
+// Parameters:
+//   samples  : array of { tMs, value }, tMs = frame time in milliseconds
+//   targetHz : output sample rate in Hz (30 Hz -> one sample every 33.3 ms)
+//
+// Returns { timesMs, values, sampleRateHz, droppedSamples, maxGapMs }
+//   droppedSamples : input frames ignored because their timestamp did not
+//                    increase (duplicate frames) or was not a number
+//   maxGapMs       : longest gap between real frames; long gaps mean the
+//                    interpolation was guessing across missing data
+export function resampleUniform(samples, targetHz) {
+  // Keep only valid samples with strictly increasing timestamps.
+  const clean = [];
+  let droppedSamples = 0;
+  for (const s of samples) {
+    const valid = Number.isFinite(s.tMs) && Number.isFinite(s.value);
+    const increasing = clean.length === 0 || s.tMs > clean[clean.length - 1].tMs;
+    if (valid && increasing) {
+      clean.push(s);
+    } else {
+      droppedSamples += 1;
+    }
+  }
+
+  const result = { timesMs: [], values: [], sampleRateHz: targetHz, droppedSamples: droppedSamples, maxGapMs: 0 };
+  if (clean.length < 2) return result;
+
+  for (let i = 1; i < clean.length; i++) {
+    const gap = clean[i].tMs - clean[i - 1].tMs;
+    if (gap > result.maxGapMs) result.maxGapMs = gap;
+  }
+
+  const stepMs = 1000 / targetHz;
+  const startMs = clean[0].tMs;
+  const endMs = clean[clean.length - 1].tMs;
+  const count = Math.floor((endMs - startMs) / stepMs) + 1;
+
+  // Walk the grid and the input together. j is the index of the real sample
+  // at or just before the current grid time.
+  let j = 0;
+  for (let k = 0; k < count; k++) {
+    const t = startMs + k * stepMs;
+    while (j < clean.length - 2 && clean[j + 1].tMs < t) {
+      j += 1;
+    }
+    const a = clean[j];
+    const b = clean[j + 1];
+    const fraction = (t - a.tMs) / (b.tMs - a.tMs); // 0 at a, 1 at b
+    result.timesMs.push(t);
+    result.values.push(a.value + fraction * (b.value - a.value));
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 3: FILTER
+// ---------------------------------------------------------------------------
+
+// detrend(signal, windowSamples)
+//
+// What: subtracts a slow moving average from the signal.
+// Why:  the raw brightness drifts slowly as finger pressure, skin temperature
+//       and camera settings change ("baseline wander"). That drift is much
+//       slower than a heartbeat. Subtracting a 1.5-second average removes it
+//       and leaves the faster pulse wave centered around zero.
+//       In filter terms this is a high-pass filter; with a 1.5 s window its
+//       -3 dB point is roughly 0.3 Hz (18 bpm), well below any real heart rate.
+//
+// Parameters:
+//   signal        : uniformly sampled values
+//   windowSamples : averaging window in samples (1.5 s x 30 Hz = 45 samples)
+export function detrend(signal, windowSamples) {
+  const baseline = centeredMovingAverage(signal, windowSamples);
+  const out = new Float64Array(signal.length);
+  for (let i = 0; i < signal.length; i++) {
+    out[i] = signal[i] - baseline[i];
+  }
+  return out;
+}
+
+// smooth(signal, windowSamples)
+//
+// What: replaces each sample with the average of its neighbors.
+// Why:  camera sensor noise changes randomly frame to frame; averaging a few
+//       frames cancels much of it while keeping the slower pulse shape.
+//       In filter terms this is a low-pass filter; a 5-sample window at
+//       30 Hz has its -3 dB point near 2.7 Hz (160 bpm) and fully blocks
+//       6 Hz. Combined with detrend() the pass band is roughly 0.3 to 2.7 Hz.
+//
+// Parameters:
+//   signal        : uniformly sampled values
+//   windowSamples : averaging window in samples (5 samples = 167 ms at 30 Hz)
+export function smooth(signal, windowSamples) {
+  return centeredMovingAverage(signal, windowSamples);
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 4: PEAK DETECTION
+// ---------------------------------------------------------------------------
+
+// detectPeaks(signal, sampleRateHz, options)
+//
+// What: finds the top of each pulse wave, i.e. one point per heartbeat.
+// How:
+//   1. Adaptive threshold. The pulse amplitude changes over a recording
+//      (pressure, lighting), so a fixed threshold would fail. We compute the
+//      local root-mean-square (RMS, a measure of typical signal size) over a
+//      3-second window around each sample, and require a peak to exceed
+//      0.5 x that local RMS.
+//   2. Candidates are local maxima (higher than the sample before, at least
+//      as high as the sample after) that clear the threshold.
+//   3. Refractory period. A heart can't beat twice within 300 ms. Taking the
+//      candidates from tallest to shortest, we accept a candidate only if no
+//      already-accepted peak lies within 300 ms. Going tallest-first means the
+//      main (systolic) peak wins over smaller bumps next to it.
+//   4. Sub-sample timing. At 30 Hz the samples are 33.3 ms apart, so a raw
+//      peak time is only accurate to +/-17 ms, which is as large as the
+//      beat-to-beat changes we want to measure. We fit a parabola through the
+//      peak sample and its two neighbors and use the parabola's vertex as the
+//      peak time. This recovers timing between samples. (It can't add
+//      information the camera didn't capture, but it removes the 33 ms
+//      staircase effect.)
+//
+// Parameters:
+//   signal        : filtered, zero-centered pulse signal, beats pointing UP
+//   sampleRateHz  : sample rate of signal in Hz
+//   options       : optional overrides of DEFAULTS
+//                   (PEAK_RMS_WINDOW_SECONDS, PEAK_THRESHOLD_RMS_MULTIPLIER, REFRACTORY_MS)
+//
+// Returns { peaks, threshold }
+//   peaks     : array of { index, timeMs, amplitude } sorted by time, where
+//               timeMs is measured from the first sample of `signal`
+//               (sub-sample precision) and amplitude is the parabola's height
+//   threshold : the adaptive threshold at every sample (for plotting)
+export function detectPeaks(signal, sampleRateHz, options) {
+  const opts = Object.assign({}, DEFAULTS, options || {});
+  const n = signal.length;
+  const msPerSample = 1000 / sampleRateHz;
+
+  // 1. Local RMS = sqrt(moving average of signal squared).
+  const squared = new Float64Array(n);
+  for (let i = 0; i < n; i++) squared[i] = signal[i] * signal[i];
+  const rmsWindow = Math.max(1, Math.round(opts.PEAK_RMS_WINDOW_SECONDS * sampleRateHz));
+  const meanSquare = centeredMovingAverage(squared, rmsWindow);
+  const threshold = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    threshold[i] = opts.PEAK_THRESHOLD_RMS_MULTIPLIER * Math.sqrt(meanSquare[i]);
+  }
+
+  // 2. Candidate local maxima above threshold. (First and last samples are
+  //    skipped because a parabola needs a neighbor on each side.)
+  const candidates = [];
+  for (let i = 1; i < n - 1; i++) {
+    const isLocalMax = signal[i] > signal[i - 1] && signal[i] >= signal[i + 1];
+    if (isLocalMax && signal[i] > threshold[i]) {
+      candidates.push(i);
+    }
+  }
+
+  // 3. Refractory period, tallest candidates first.
+  const refractorySamples = opts.REFRACTORY_MS / msPerSample;
+  const byHeight = candidates.slice().sort((a, b) => signal[b] - signal[a]);
+  const accepted = [];
+  for (const idx of byHeight) {
+    let tooClose = false;
+    for (const other of accepted) {
+      if (Math.abs(idx - other) < refractorySamples) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (!tooClose) accepted.push(idx);
+  }
+  accepted.sort((a, b) => a - b);
+
+  // 4. Parabolic interpolation around each accepted peak.
+  //    With y0 = signal[i-1], y1 = signal[i], y2 = signal[i+1], the vertex of
+  //    the parabola through these three points is offset from i by
+  //        delta = 0.5 * (y0 - y2) / (y0 - 2*y1 + y2)      (between -0.5 and +0.5)
+  //    and its height is
+  //        y1 - 0.25 * (y0 - y2) * delta
+  const peaks = [];
+  for (const i of accepted) {
+    const y0 = signal[i - 1];
+    const y1 = signal[i];
+    const y2 = signal[i + 1];
+    const denominator = y0 - 2 * y1 + y2;
+    let delta = 0;
+    if (denominator !== 0) {
+      delta = 0.5 * (y0 - y2) / denominator;
+    }
+    // Safety clamp: for a true local maximum delta is already within +/-0.5.
+    if (delta > 0.5) delta = 0.5;
+    if (delta < -0.5) delta = -0.5;
+    peaks.push({
+      index: i,
+      timeMs: (i + delta) * msPerSample,
+      amplitude: y1 - 0.25 * (y0 - y2) * delta,
+    });
+  }
+  return { peaks: peaks, threshold: threshold };
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 5: INTER-BEAT INTERVALS
+// ---------------------------------------------------------------------------
+
+// peaksToIBIs(peakTimesMs)
+//
+// What: converts beat times into inter-beat intervals (IBIs): the time from
+//       each beat to the next, in ms. N beats give N-1 intervals.
+// Example: beats at [0, 850, 1690] ms -> IBIs [850, 840] ms.
+export function peaksToIBIs(peakTimesMs) {
+  const ibis = [];
+  for (let i = 1; i < peakTimesMs.length; i++) {
+    ibis.push(peakTimesMs[i] - peakTimesMs[i - 1]);
+  }
+  return ibis;
+}
+
+// filterIBIs(ibis, options)
+//
+// What: removes intervals that are almost certainly detection errors rather
+//       than real heartbeats, and REPORTS how many were removed.
+// Rules (applied in this order):
+//   1. Range: outside [300, 2000] ms (i.e. faster than 200 bpm or slower
+//      than 30 bpm) is physiologically implausible here -> reject.
+//   2. Neighbor check: compare the interval with the median of up to 2
+//      intervals before and 2 after it (only ones that passed rule 1).
+//      If it differs from that median by more than 50% -> reject.
+//      A missed beat makes one interval about twice as long (+100%); an
+//      extra false beat splits one interval into two short ones. Both are
+//      caught by this rule.
+//
+// IMPORTANT TRADE-OFF: a genuinely irregular rhythm also produces intervals
+// that differ a lot from their neighbors. A strict neighbor rule can throw
+// away real irregular beats. The 50% limit is deliberately loose for that
+// reason, and the rejection COUNT is reported so it can't hide.
+//
+// Parameters:
+//   ibis    : inter-beat intervals in ms
+//   options : optional overrides (IBI_MIN_MS, IBI_MAX_MS, IBI_NEIGHBOR_COUNT,
+//             IBI_MAX_DEVIATION_FRACTION)
+//
+// Returns {
+//   kept            : the accepted intervals, in order
+//   keptIndices     : position of each kept interval in the ORIGINAL list.
+//                     Needed later: a successive difference is only valid
+//                     between two intervals that were truly adjacent.
+//   rejectedCount   : how many were rejected
+//   rejectedIndices : positions of the rejected intervals
+//   rejectedReasons : 'out of range' or 'differs from neighbors', per rejection
+//   total           : number of intervals before filtering
+// }
+export function filterIBIs(ibis, options) {
+  const opts = Object.assign({}, DEFAULTS, options || {});
+  const n = ibis.length;
+
+  // Rule 1: plausible range.
+  const inRange = [];
+  for (let i = 0; i < n; i++) {
+    inRange.push(ibis[i] >= opts.IBI_MIN_MS && ibis[i] <= opts.IBI_MAX_MS);
+  }
+
+  const kept = [];
+  const keptIndices = [];
+  const rejectedIndices = [];
+  const rejectedReasons = [];
+
+  for (let i = 0; i < n; i++) {
+    if (!inRange[i]) {
+      rejectedIndices.push(i);
+      rejectedReasons.push('out of range');
+      continue;
+    }
+
+    // Rule 2: compare with the median of in-range neighbors.
+    const neighbors = [];
+    for (let j = i - opts.IBI_NEIGHBOR_COUNT; j <= i + opts.IBI_NEIGHBOR_COUNT; j++) {
+      if (j === i || j < 0 || j >= n) continue;
+      if (inRange[j]) neighbors.push(ibis[j]);
+    }
+    if (neighbors.length > 0) {
+      const ref = median(neighbors);
+      const deviation = Math.abs(ibis[i] - ref) / ref;
+      if (deviation > opts.IBI_MAX_DEVIATION_FRACTION) {
+        rejectedIndices.push(i);
+        rejectedReasons.push('differs from neighbors');
+        continue;
+      }
+    }
+
+    kept.push(ibis[i]);
+    keptIndices.push(i);
+  }
+
+  return {
+    kept: kept,
+    keptIndices: keptIndices,
+    rejectedCount: rejectedIndices.length,
+    rejectedIndices: rejectedIndices,
+    rejectedReasons: rejectedReasons,
+    total: n,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 6: METRICS (P1 provides mean heart rate; the rest arrive in P2)
+// ---------------------------------------------------------------------------
+
+// meanHeartRateBpm(ibis)
+//
+// meanHR = 60000 / mean(IBI)
+// 60000 is the number of milliseconds in a minute, so an average interval of
+// 857 ms gives 60000 / 857 = 70 beats per minute.
+export function meanHeartRateBpm(ibis) {
+  if (ibis.length === 0) return NaN;
+  return 60000 / mean(ibis);
+}
+
+// ---------------------------------------------------------------------------
+// FULL PIPELINE
+// ---------------------------------------------------------------------------
+
+// analyzeRecording(samples, options)
+//
+// Runs every stage in order. Both index.html and validate.html call this one
+// function, so the validation page exercises exactly the same steps.
+//
+// Parameters:
+//   samples : array of { tMs, value }, raw red-channel brightness per frame,
+//             in CAMERA convention (brightness DIPS at each heartbeat,
+//             because blood absorbs light)
+//   options : optional overrides of DEFAULTS
+//
+// Returns every intermediate result so the UI can plot each stage.
+export function analyzeRecording(samples, options) {
+  const opts = Object.assign({}, DEFAULTS, options || {});
+
+  // Stage 2: uniform grid.
+  const resampled = resampleUniform(samples, opts.RESAMPLE_HZ);
+  const fs = resampled.sampleRateHz;
+  const startMs = resampled.timesMs.length > 0 ? resampled.timesMs[0] : 0;
+
+  // Invert so that heartbeats point UP. More blood -> less light reaches the
+  // camera -> brightness dips at each beat. Peak detection looks for maxima.
+  const inverted = resampled.values.map((v) => -v);
+
+  // Stage 3: remove baseline drift, then smooth sensor noise.
+  const detrended = detrend(inverted, Math.round(opts.DETREND_SECONDS * fs));
+  const filtered = smooth(detrended, opts.SMOOTH_SAMPLES);
+
+  // Stage 4: beats. Peak times are converted back to recording time.
+  const peakResult = detectPeaks(filtered, fs, opts);
+  const peakTimesMs = peakResult.peaks.map((p) => p.timeMs + startMs);
+
+  // Stage 5: intervals, with implausible ones rejected and counted.
+  const ibis = peaksToIBIs(peakTimesMs);
+  const ibiResult = filterIBIs(ibis, opts);
+
+  // Stage 6 (P1 subset): mean heart rate from accepted intervals only.
+  const meanHR = meanHeartRateBpm(ibiResult.kept);
+
+  return {
+    resampled: resampled,
+    filtered: filtered,
+    threshold: peakResult.threshold,
+    peaks: peakResult.peaks,
+    peakTimesMs: peakTimesMs,
+    ibis: ibis,
+    ibiResult: ibiResult,
+    meanHR: meanHR,
+  };
+}

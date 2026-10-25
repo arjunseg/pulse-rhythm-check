@@ -1,0 +1,909 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>Pulse Rhythm Check</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #171b22;
+    --line: #2a313c;
+    --text: #e8ecf1;
+    --muted: #9aa4b2;
+    --accent: #ff4d5e;
+    --ok: #3ccf91;
+    --warn: #f5b041;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.45;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 16px 0 32px; }
+  h1 { font-size: 1.6rem; margin: 8px 0 4px; }
+  h2 { font-size: 1.25rem; margin: 8px 0; }
+  p { margin: 8px 0; }
+  .lede { color: var(--muted); }
+  .safety {
+    border: 1px solid var(--warn);
+    background: rgba(245, 176, 65, 0.08);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin: 16px 0;
+    font-size: 0.95rem;
+  }
+  .safety strong { color: var(--warn); }
+  ol.howto { padding-left: 20px; margin: 12px 0; }
+  ol.howto li { margin: 6px 0; }
+  button {
+    display: block;
+    width: 100%;
+    font-size: 1.1rem;
+    font-weight: 600;
+    padding: 14px;
+    border-radius: 12px;
+    border: 0;
+    background: var(--accent);
+    color: #fff;
+    margin: 12px 0;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--line); }
+  .error { color: var(--accent); }
+  .notice {
+    background: var(--panel);
+    border-left: 3px solid var(--warn);
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin: 8px 0;
+    font-size: 0.9rem;
+  }
+  .capture-top { display: flex; align-items: center; gap: 16px; margin: 8px 0 12px; }
+  #preview {
+    width: 88px; height: 88px;
+    border-radius: 50%;
+    object-fit: cover;
+    background: #000;
+    border: 2px solid var(--line);
+    flex: none;
+  }
+  #phase-label { color: var(--muted); font-size: 0.95rem; }
+  #countdown { font-size: 3rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+  .pill {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    background: var(--panel);
+    border: 1px solid var(--line);
+  }
+  .pill.ok { border-color: var(--ok); color: var(--ok); }
+  .pill.bad { border-color: var(--accent); color: var(--accent); }
+  canvas.wave {
+    display: block;
+    width: 100%;
+    height: 180px;
+    background: var(--panel);
+    border-radius: 10px;
+    margin: 12px 0 6px;
+  }
+  .stats { color: var(--muted); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+  table.kv { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+  table.kv td { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  table.kv td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .small { font-size: 0.85rem; color: var(--muted); }
+  h3 { font-size: 1rem; margin: 20px 0 4px; }
+  .big-number { font-size: 3rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .big-number .unit { font-size: 1rem; font-weight: 400; color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+
+  <!-- ===================== LANDING SCREEN ===================== -->
+  <section id="screen-landing">
+    <h1>Pulse Rhythm Check</h1>
+    <p class="lede">
+      An educational tool that estimates how regular your pulse rhythm is,
+      using your phone's rear camera and a fingertip.
+    </p>
+
+    <div class="safety">
+      <strong>Not a medical device.</strong> This app does not diagnose any condition.
+      It has not been validated against ECG. If you have symptoms or concerns about
+      your heart rhythm, contact a clinician.
+    </div>
+
+    <h2>How to measure</h2>
+    <ol class="howto">
+      <li>Sit down and rest quietly for a minute.</li>
+      <li>Rest your index fingertip over the <b>rear camera and the flash</b> together.
+          Press lightly: pressing hard squeezes the blood out and the pulse disappears.</li>
+      <li>Keep your hand and phone still for about 50 seconds (5 s to settle + 45 s recording).</li>
+    </ol>
+
+    <button id="btn-start">Start measurement</button>
+    <p id="landing-error" class="error" hidden></p>
+  </section>
+
+  <!-- ===================== CAPTURE SCREEN ===================== -->
+  <section id="screen-capture" hidden>
+    <div class="capture-top">
+      <!-- Small live preview so the user can see the red glow of a covered lens. -->
+      <video id="preview" playsinline muted autoplay></video>
+      <div>
+        <div id="phase-label">Settling…</div>
+        <div id="countdown">–</div>
+      </div>
+    </div>
+
+    <span id="finger-status" class="pill">Checking for finger…</span>
+    <div id="notices"></div>
+
+    <canvas id="live-wave" class="wave"></canvas>
+    <div id="live-stats" class="stats">Waiting for camera…</div>
+
+    <button id="btn-skip-check" class="secondary" hidden>Start anyway (finger check unsure)</button>
+    <button id="btn-cancel" class="secondary">Cancel</button>
+    <p class="small">Not a medical device. Not validated against ECG.</p>
+  </section>
+
+  <!-- ===================== RESULTS SCREEN ===================== -->
+  <section id="screen-results" hidden>
+    <h2>Results</h2>
+    <div class="big-number"><span id="hr-value">–</span> <span class="unit">bpm average</span></div>
+    <p class="small" id="beat-summary"></p>
+
+    <h3>Detected beats: 10-second close-up</h3>
+    <canvas id="zoom-wave" class="wave"></canvas>
+    <h3>Detected beats: full recording</h3>
+    <canvas id="result-wave" class="wave"></canvas>
+    <p class="small">
+      Filtered pulse signal (beats point upward). Dots mark detected beats;
+      the dashed line is the adaptive detection threshold.
+    </p>
+
+    <h3>Recording details</h3>
+    <table class="kv" id="capture-summary"></table>
+    <button id="btn-download" class="secondary">Download raw data (CSV)</button>
+
+    <div class="safety">
+      <strong>Not a medical device.</strong> This app does not diagnose any condition.
+      It has not been validated against ECG. If you have symptoms or concerns about
+      your heart rhythm, contact a clinician.
+    </div>
+
+    <button id="btn-again">Measure again</button>
+  </section>
+
+</main>
+
+<script type="module">
+// ============================================================================
+// index.html: capture UI.
+//
+// This file is responsible for the camera, the user interface and drawing.
+// All signal processing math lives in dsp.js, so the validation page
+// (validate.html) can test exactly the same code.
+// ============================================================================
+import * as dsp from './dsp.js';
+
+// ---------------------------------------------------------------------------
+// Configuration. Every number here is a design choice, not a published value.
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  RECORD_SECONDS: 45,        // length of the analysed recording
+  SETTLE_SECONDS: 5,         // finger must be steady this long before recording.
+                             // Lets auto-exposure adapt to the finger before we lock it.
+  SAMPLE_WIDTH: 160,         // each video frame is shrunk to 160x120 before reading pixels
+  SAMPLE_HEIGHT: 120,
+  ROI_WIDTH: 80,             // we only average the central 80x60 region (region of interest)
+  ROI_HEIGHT: 60,
+  LIVE_WINDOW_SECONDS: 6,    // the live waveform shows the most recent 6 seconds
+  LIVE_DETREND_SECONDS: 1.5, // display-only baseline removal window (see drawLiveWave)
+  SKIP_CHECK_AFTER_SECONDS: 10, // offer "start anyway" if finger detection stays unsure this long
+  STALL_TIMEOUT_MS: 3000,    // abort if the camera delivers no frames for 3 s
+
+  // Finger-detection heuristic (ARBITRARY, tuned by eye, not published):
+  // a fingertip lit from behind looks strongly red, so the red average must be
+  // reasonably bright AND clearly larger than the green average.
+  FINGER_MIN_RED: 30,        // 0..255 scale
+  FINGER_RED_TO_GREEN: 1.4,  // red must be at least 1.4x green
+  SATURATION_RED: 250,       // red average at or above this is treated as clipped
+};
+
+// ---------------------------------------------------------------------------
+// Element lookups
+// ---------------------------------------------------------------------------
+const screens = {
+  landing: document.getElementById('screen-landing'),
+  capture: document.getElementById('screen-capture'),
+  results: document.getElementById('screen-results'),
+};
+const video = document.getElementById('preview');
+const phaseLabel = document.getElementById('phase-label');
+const countdownEl = document.getElementById('countdown');
+const fingerStatus = document.getElementById('finger-status');
+const noticesEl = document.getElementById('notices');
+const liveCanvas = document.getElementById('live-wave');
+const liveStats = document.getElementById('live-stats');
+const resultCanvas = document.getElementById('result-wave');
+const zoomCanvas = document.getElementById('zoom-wave');
+const hrValue = document.getElementById('hr-value');
+const beatSummary = document.getElementById('beat-summary');
+const btnDownload = document.getElementById('btn-download');
+const summaryTable = document.getElementById('capture-summary');
+const landingError = document.getElementById('landing-error');
+const btnStart = document.getElementById('btn-start');
+const btnCancel = document.getElementById('btn-cancel');
+const btnAgain = document.getElementById('btn-again');
+const btnSkipCheck = document.getElementById('btn-skip-check');
+
+// Offscreen canvas used to read pixel values from each video frame.
+// willReadFrequently tells the browser we will call getImageData every frame,
+// so it keeps the pixels in CPU memory (much faster readback).
+const sampleCanvas = document.createElement('canvas');
+sampleCanvas.width = CONFIG.SAMPLE_WIDTH;
+sampleCanvas.height = CONFIG.SAMPLE_HEIGHT;
+const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+
+// ---------------------------------------------------------------------------
+// Session state (reset at the start of every measurement)
+// ---------------------------------------------------------------------------
+let stream = null;            // MediaStream from getUserMedia
+let track = null;             // the single video track inside that stream
+let running = false;          // true while we are pulling frames
+let phase = 'idle';           // 'settle' -> 'locking' -> 'record' -> 'done'
+let appliedAdvanced = {};     // camera constraints that succeeded (torch, exposure, wb)
+let cameraInfo = {};          // what we learned about the camera, shown on results
+let timestampSource = null;   // which clock we use for frame times, fixed on first frame
+let lastFrameTimeMs = null;   // previous frame time, for settle accounting
+let lastFrameWallMs = 0;      // performance.now() when the last frame arrived (stall check)
+let settleAccumMs = 0;        // how long the finger has been continuously detected
+let fingerLostSinceMs = null; // when finger detection last went false during settle
+let skipFingerCheck = false;  // user pressed "start anyway"
+let recordStartMs = null;     // timestamp of the first recorded frame
+let samples = [];             // recorded {tMs, value} pairs, tMs relative to recordStartMs
+let liveBuffer = [];          // recent {tMs, value} for the live waveform (any phase)
+let recordStats = null;       // counters collected during recording
+let wakeLock = null;
+let stallTimer = null;
+
+// ---------------------------------------------------------------------------
+// Screen switching
+// ---------------------------------------------------------------------------
+function showScreen(name) {
+  for (const key of Object.keys(screens)) {
+    screens[key].hidden = (key !== name);
+  }
+  window.scrollTo(0, 0);
+}
+
+function addNotice(text) {
+  const div = document.createElement('div');
+  div.className = 'notice';
+  div.textContent = text;
+  noticesEl.appendChild(div);
+}
+
+// ---------------------------------------------------------------------------
+// CAMERA SETUP
+// ---------------------------------------------------------------------------
+
+// Try to apply one extra camera setting (e.g. torch on) WITHOUT losing the
+// settings that already succeeded. applyConstraints replaces the whole
+// constraint set, so if we sent only {exposureMode} the torch could switch
+// back off on some Android phones. We therefore always resend everything
+// that has worked so far plus the new setting.
+async function tryAdvancedConstraint(key, value) {
+  const candidate = Object.assign({}, appliedAdvanced);
+  candidate[key] = value;
+  try {
+    await track.applyConstraints({ advanced: [candidate] });
+    appliedAdvanced = candidate;
+    return true;
+  } catch (err) {
+    console.warn('Constraint rejected:', key, value, err);
+    return false;
+  }
+}
+
+function getCapabilitiesSafe() {
+  // getCapabilities is missing in some browsers (e.g. older Firefox).
+  if (track && typeof track.getCapabilities === 'function') {
+    return track.getCapabilities();
+  }
+  return {};
+}
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error('Camera access is not available. The page must be opened over HTTPS (or localhost).');
+  }
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: {
+      facingMode: { ideal: 'environment' }, // rear camera, but fall back to any camera
+      width: { ideal: 640 },
+      height: { ideal: 480 },
+      frameRate: { ideal: 30 },
+    },
+  });
+  track = stream.getVideoTracks()[0];
+  appliedAdvanced = {};
+
+  video.srcObject = stream;
+  await video.play();
+
+  const caps = getCapabilitiesSafe();
+  const settings = track.getSettings ? track.getSettings() : {};
+  cameraInfo = {
+    label: track.label || 'unknown',
+    width: settings.width,
+    height: settings.height,
+    requestedFrameRate: settings.frameRate,
+    torch: false,
+    exposureLocked: false,
+    whiteBalanceLocked: false,
+  };
+
+  // Torch (flash LED). Not supported on iOS Safari, and that's fine: a bright
+  // lamp shining through the fingertip works too. We never block on this.
+  if (caps.torch === true) {
+    cameraInfo.torch = await tryAdvancedConstraint('torch', true);
+  }
+  if (!cameraInfo.torch) {
+    addNotice('Flashlight control is not available in this browser. ' +
+              'Hold your fingertip over the camera under a bright lamp instead.');
+  }
+}
+
+// Lock exposure and white balance AFTER the settle period, once the camera's
+// automatic adjustment has adapted to the finger. If white balance stays
+// automatic, the camera keeps re-balancing colour and can cancel out the
+// tiny brightness changes we are trying to measure.
+async function lockExposureAndWhiteBalance() {
+  const caps = getCapabilitiesSafe();
+  if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('manual')) {
+    cameraInfo.exposureLocked = await tryAdvancedConstraint('exposureMode', 'manual');
+  }
+  if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual')) {
+    cameraInfo.whiteBalanceLocked = await tryAdvancedConstraint('whiteBalanceMode', 'manual');
+  }
+  if (!cameraInfo.exposureLocked || !cameraInfo.whiteBalanceLocked) {
+    addNotice('This camera does not let us lock exposure/white balance. ' +
+              'The signal may be weaker, so keep very still.');
+  }
+}
+
+function stopCamera() {
+  running = false;
+  if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+  if (stream) {
+    for (const t of stream.getTracks()) { t.stop(); } // stopping the track also turns the torch off
+  }
+  stream = null;
+  track = null;
+  video.srcObject = null;
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+
+// ---------------------------------------------------------------------------
+// FRAME SAMPLING
+//
+// requestVideoFrameCallback fires once per NEW camera frame and tells us when
+// that frame was captured/presented. That is much more accurate than
+// requestAnimationFrame, which fires at the screen refresh rate (often 60 Hz)
+// and may see the same camera frame twice. We record real timestamps and never
+// assume a fixed frame rate; dsp.js resamples to a uniform grid later.
+// ---------------------------------------------------------------------------
+const hasVideoFrameCallback = ('requestVideoFrameCallback' in HTMLVideoElement.prototype);
+
+function scheduleNextFrame() {
+  if (!running) return;
+  if (hasVideoFrameCallback) {
+    video.requestVideoFrameCallback(onVideoFrame);
+  } else {
+    requestAnimationFrame(onAnimationFrame);
+  }
+}
+
+function onVideoFrame(now, metadata) {
+  // Pick ONE clock on the first frame and keep it, so we never mix time bases.
+  // captureTime = when the sensor captured the frame (best, not always present)
+  // presentationTime = when the browser received the frame for display
+  if (timestampSource === null) {
+    if (typeof metadata.captureTime === 'number' && metadata.captureTime > 0) {
+      timestampSource = 'rVFC captureTime';
+    } else if (typeof metadata.presentationTime === 'number' && metadata.presentationTime > 0) {
+      timestampSource = 'rVFC presentationTime';
+    } else {
+      timestampSource = 'rVFC callback time';
+    }
+  }
+  let tMs;
+  if (timestampSource === 'rVFC captureTime') {
+    tMs = metadata.captureTime;
+  } else if (timestampSource === 'rVFC presentationTime') {
+    tMs = metadata.presentationTime;
+  } else {
+    tMs = now;
+  }
+  handleFrame(tMs);
+  scheduleNextFrame();
+}
+
+function onAnimationFrame(now) {
+  if (timestampSource === null) {
+    timestampSource = 'requestAnimationFrame (fallback)';
+  }
+  handleFrame(now);
+  scheduleNextFrame();
+}
+
+// Read one frame: shrink it to 160x120, average the red/green/blue values in
+// the central 80x60 region. Returns null if the video isn't ready yet.
+function readFrameColor() {
+  if (video.readyState < 2) return null; // HAVE_CURRENT_DATA
+  sampleCtx.drawImage(video, 0, 0, CONFIG.SAMPLE_WIDTH, CONFIG.SAMPLE_HEIGHT);
+  const roiX = Math.floor((CONFIG.SAMPLE_WIDTH - CONFIG.ROI_WIDTH) / 2);
+  const roiY = Math.floor((CONFIG.SAMPLE_HEIGHT - CONFIG.ROI_HEIGHT) / 2);
+  const pixels = sampleCtx.getImageData(roiX, roiY, CONFIG.ROI_WIDTH, CONFIG.ROI_HEIGHT).data;
+
+  // pixels is a flat array: [R, G, B, A, R, G, B, A, ...]
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  for (let i = 0; i < pixels.length; i += 4) {
+    sumR += pixels[i];
+    sumG += pixels[i + 1];
+    sumB += pixels[i + 2];
+  }
+  const count = pixels.length / 4;
+  return { r: sumR / count, g: sumG / count, b: sumB / count };
+}
+
+function isFingerPresent(color) {
+  return color.r >= CONFIG.FINGER_MIN_RED &&
+         color.r >= CONFIG.FINGER_RED_TO_GREEN * color.g;
+}
+
+// Called once per camera frame with that frame's timestamp in milliseconds.
+function handleFrame(tMs) {
+  const color = readFrameColor();
+  if (color === null) return;
+  lastFrameWallMs = performance.now();
+
+  const finger = isFingerPresent(color);
+  updateFingerPill(finger, color);
+
+  // Keep the last few seconds for the live chart.
+  liveBuffer.push({ tMs: tMs, value: color.r });
+  while (liveBuffer.length > 0 &&
+         tMs - liveBuffer[0].tMs > CONFIG.LIVE_WINDOW_SECONDS * 1000) {
+    liveBuffer.shift();
+  }
+
+  const dtMs = (lastFrameTimeMs === null) ? 0 : (tMs - lastFrameTimeMs);
+  lastFrameTimeMs = tMs;
+
+  if (phase === 'settle') {
+    handleSettleFrame(tMs, dtMs, finger);
+  } else if (phase === 'record') {
+    handleRecordFrame(tMs, color, finger);
+  }
+  // During 'locking' we keep drawing but don't record: the brightness can
+  // jump while the camera applies the lock.
+
+  drawLiveWave();
+  updateLiveStats(color);
+}
+
+function handleSettleFrame(tMs, dtMs, finger) {
+  phaseLabel.textContent = 'Hold still: getting ready';
+  if (finger || skipFingerCheck) {
+    settleAccumMs += dtMs;
+    fingerLostSinceMs = null;
+    btnSkipCheck.hidden = true;
+  } else {
+    // Require the finger to be present CONTINUOUSLY for the settle period.
+    settleAccumMs = 0;
+    if (fingerLostSinceMs === null) fingerLostSinceMs = tMs;
+    if (tMs - fingerLostSinceMs > CONFIG.SKIP_CHECK_AFTER_SECONDS * 1000) {
+      btnSkipCheck.hidden = false;
+    }
+  }
+  const remaining = Math.max(0, CONFIG.SETTLE_SECONDS - settleAccumMs / 1000);
+  countdownEl.textContent = Math.ceil(remaining);
+
+  if (settleAccumMs >= CONFIG.SETTLE_SECONDS * 1000) {
+    phase = 'locking';
+    phaseLabel.textContent = 'Locking camera…';
+    btnSkipCheck.hidden = true;
+    lockExposureAndWhiteBalance().finally(() => {
+      if (!running) return;
+      phase = 'record';
+      recordStartMs = null; // set by the first recorded frame
+    });
+  }
+}
+
+function handleRecordFrame(tMs, color, finger) {
+  if (recordStartMs === null) {
+    recordStartMs = tMs;
+    recordStats = { noFingerFrames: 0, saturatedFrames: 0, totalFrames: 0 };
+  }
+  const relMs = tMs - recordStartMs;
+  samples.push({ tMs: relMs, value: color.r });
+
+  recordStats.totalFrames += 1;
+  if (!finger) recordStats.noFingerFrames += 1;
+  if (color.r >= CONFIG.SATURATION_RED) recordStats.saturatedFrames += 1;
+
+  const remaining = Math.max(0, CONFIG.RECORD_SECONDS - relMs / 1000);
+  phaseLabel.textContent = 'Recording: keep still';
+  countdownEl.textContent = Math.ceil(remaining);
+
+  if (relMs >= CONFIG.RECORD_SECONDS * 1000) {
+    finishRecording();
+  }
+}
+
+function updateFingerPill(finger, color) {
+  if (color.r >= CONFIG.SATURATION_RED) {
+    fingerStatus.textContent = 'Image too bright (clipped): adjust finger';
+    fingerStatus.className = 'pill bad';
+  } else if (finger) {
+    fingerStatus.textContent = 'Finger detected';
+    fingerStatus.className = 'pill ok';
+  } else {
+    fingerStatus.textContent = 'Cover the camera and flash with your fingertip';
+    fingerStatus.className = 'pill bad';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DRAWING (plain canvas 2D, no libraries)
+// ---------------------------------------------------------------------------
+
+// Match the canvas's pixel buffer to its on-screen size × device pixel ratio,
+// so lines stay sharp on high-density phone screens.
+function prepareCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth;
+  const cssHeight = canvas.clientHeight;
+  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+    canvas.width = Math.round(cssWidth * dpr);
+    canvas.height = Math.round(cssHeight * dpr);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS pixels from here on
+  return { ctx: ctx, width: cssWidth, height: cssHeight };
+}
+
+// Draw a series of {t, y} points scaled to fill the canvas.
+function drawTrace(canvas, points, tStart, tEnd, color) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+
+  // Faint horizontal guide lines.
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (height * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.stroke();
+  }
+  if (points.length < 2) return;
+
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of points) {
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
+  }
+  const range = (maxY - minY) || 1;
+  const padding = 10;
+
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    const x = ((points[i].t - tStart) / (tEnd - tStart)) * width;
+    const y = padding + (1 - (points[i].y - minY) / range) * (height - 2 * padding);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+// Filtered signal with detected beats marked, between tStartMs and tEndMs.
+//   timesMs, values : the uniformly resampled, filtered signal
+//   threshold       : adaptive detection threshold per sample (dashed line)
+//   peaks           : array of { tMs, amplitude } detected beats (dots)
+// Also draws a time axis in seconds along the bottom.
+function drawSignalWithPeaks(canvas, timesMs, values, threshold, peaks, tStartMs, tEndMs) {
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  const axisHeight = 18;
+  const plotHeight = height - axisHeight;
+  const padding = 10;
+
+  // Vertical range from the visible part of the signal only.
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < timesMs.length; i++) {
+    if (timesMs[i] < tStartMs || timesMs[i] > tEndMs) continue;
+    if (values[i] < minY) minY = values[i];
+    if (values[i] > maxY) maxY = values[i];
+  }
+  if (!Number.isFinite(minY)) return;
+  const range = (maxY - minY) || 1;
+  const xOf = (t) => ((t - tStartMs) / (tEndMs - tStartMs)) * width;
+  const yOf = (v) => padding + (1 - (v - minY) / range) * (plotHeight - 2 * padding);
+
+  // Time axis: a tick every 1 s (close-up) or 5 s (full recording).
+  const spanS = (tEndMs - tStartMs) / 1000;
+  const tickS = spanS <= 15 ? 1 : 5;
+  ctx.fillStyle = '#9aa4b2';
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.font = '11px -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  for (let s = Math.ceil(tStartMs / 1000 / tickS) * tickS; s <= tEndMs / 1000; s += tickS) {
+    const x = xOf(s * 1000);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, plotHeight);
+    ctx.stroke();
+    if (x > 12 && x < width - 12) ctx.fillText(s + 's', x, height - 4); // skip labels cut off at the edges
+  }
+
+  // Signal and threshold, clipped to the visible window.
+  const traceLine = (series, color, dashed) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = dashed ? 1 : 2;
+    ctx.setLineDash(dashed ? [4, 4] : []);
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < timesMs.length; i++) {
+      if (timesMs[i] < tStartMs || timesMs[i] > tEndMs) continue;
+      const x = xOf(timesMs[i]);
+      const y = yOf(Math.max(minY, Math.min(maxY, series[i])));
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+  traceLine(threshold, 'rgba(154,164,178,0.6)', true);
+  traceLine(values, '#ff4d5e', false);
+
+  // Beat markers.
+  ctx.fillStyle = '#ffffff';
+  for (const p of peaks) {
+    if (p.tMs < tStartMs || p.tMs > tEndMs) continue;
+    ctx.beginPath();
+    ctx.arc(xOf(p.tMs), yOf(p.amplitude), 3.5, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+}
+
+// Live waveform. For DISPLAY ONLY we:
+//   1. invert the signal: more blood in the fingertip absorbs more light, so
+//      the raw brightness DIPS at each heartbeat; flipping it makes beats point up.
+//   2. subtract a 1.5 s moving average, so slow drift from finger pressure
+//      doesn't push the pulse off the chart.
+// The analysed data is NOT changed by this; it's purely cosmetic.
+function drawLiveWave() {
+  const n = liveBuffer.length;
+  if (n < 2) return;
+  const windowMs = CONFIG.LIVE_DETREND_SECONDS * 1000;
+  const points = [];
+  let windowStart = 0;
+  let windowSum = 0;
+  for (let i = 0; i < n; i++) {
+    windowSum += liveBuffer[i].value;
+    while (liveBuffer[i].tMs - liveBuffer[windowStart].tMs > windowMs) {
+      windowSum -= liveBuffer[windowStart].value;
+      windowStart += 1;
+    }
+    const localMean = windowSum / (i - windowStart + 1);
+    points.push({ t: liveBuffer[i].tMs, y: -(liveBuffer[i].value - localMean) });
+  }
+  const tEnd = liveBuffer[n - 1].tMs;
+  const tStart = tEnd - CONFIG.LIVE_WINDOW_SECONDS * 1000;
+  const color = (phase === 'record') ? '#ff4d5e' : '#9aa4b2';
+  drawTrace(liveCanvas, points, tStart, tEnd, color);
+}
+
+function updateLiveStats(color) {
+  // Frame rate from the median of recent frame intervals.
+  let fpsText = '–';
+  if (liveBuffer.length > 10) {
+    const intervals = [];
+    for (let i = liveBuffer.length - 30 < 1 ? 1 : liveBuffer.length - 30; i < liveBuffer.length; i++) {
+      intervals.push(liveBuffer[i].tMs - liveBuffer[i - 1].tMs);
+    }
+    intervals.sort((a, b) => a - b);
+    const median = intervals[Math.floor(intervals.length / 2)];
+    if (median > 0) fpsText = (1000 / median).toFixed(1);
+  }
+  liveStats.textContent =
+    'fps ' + fpsText +
+    ' · red ' + color.r.toFixed(1) +
+    ' · green ' + color.g.toFixed(1) +
+    ' · recorded ' + samples.length + ' frames';
+}
+
+// ---------------------------------------------------------------------------
+// MEASUREMENT FLOW
+// ---------------------------------------------------------------------------
+function resetSession() {
+  phase = 'idle';
+  timestampSource = null;
+  lastFrameTimeMs = null;
+  settleAccumMs = 0;
+  fingerLostSinceMs = null;
+  skipFingerCheck = false;
+  recordStartMs = null;
+  samples = [];
+  liveBuffer = [];
+  recordStats = null;
+  noticesEl.innerHTML = '';
+  btnSkipCheck.hidden = true;
+  countdownEl.textContent = '–';
+  phaseLabel.textContent = 'Starting camera…';
+}
+
+async function startMeasurement() {
+  landingError.hidden = true;
+  resetSession();
+  showScreen('capture');
+
+  try {
+    await startCamera();
+  } catch (err) {
+    stopCamera();
+    showScreen('landing');
+    landingError.textContent = 'Could not start the camera: ' + (err && err.message ? err.message : err);
+    landingError.hidden = false;
+    return;
+  }
+
+  // Keep the screen awake during the measurement (not supported everywhere).
+  if ('wakeLock' in navigator) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { wakeLock = null; }
+  }
+
+  running = true;
+  phase = 'settle';
+  lastFrameWallMs = performance.now();
+
+  // Abort if frames stop arriving (camera frozen, app backgrounded, etc).
+  stallTimer = setInterval(() => {
+    if (running && performance.now() - lastFrameWallMs > CONFIG.STALL_TIMEOUT_MS) {
+      abortMeasurement('The camera stopped sending frames. Please try again.');
+    }
+  }, 500);
+
+  scheduleNextFrame();
+}
+
+function abortMeasurement(message) {
+  stopCamera();
+  phase = 'idle';
+  showScreen('landing');
+  if (message) {
+    landingError.textContent = message;
+    landingError.hidden = false;
+  }
+}
+
+function finishRecording() {
+  phase = 'done';
+  stopCamera();
+  showResults();
+}
+
+// Results: run the full dsp.js pipeline on the recorded samples and display it.
+function showResults() {
+  showScreen('results');
+
+  const analysis = dsp.analyzeRecording(samples);
+  const ibiResult = analysis.ibiResult;
+
+  hrValue.textContent = Number.isFinite(analysis.meanHR) ? analysis.meanHR.toFixed(0) : '–';
+  beatSummary.textContent =
+    analysis.peaks.length + ' beats detected · ' +
+    ibiResult.kept.length + ' of ' + ibiResult.total + ' beat-to-beat intervals accepted · ' +
+    ibiResult.rejectedCount + ' rejected as implausible. ' +
+    'Rhythm metrics and signal-quality check come in the next build stages.';
+
+  // Charts: a 10 s close-up from the middle of the recording, then all 45 s.
+  const timesMs = analysis.resampled.timesMs;
+  const peakPoints = analysis.peaks.map((p, i) => ({ tMs: analysis.peakTimesMs[i], amplitude: p.amplitude }));
+  const endMs = timesMs.length ? timesMs[timesMs.length - 1] : 1;
+  const zoomStart = Math.max(0, endMs / 2 - 5000);
+  drawSignalWithPeaks(zoomCanvas, timesMs, analysis.filtered, analysis.threshold, peakPoints,
+                      zoomStart, Math.min(endMs, zoomStart + 10000));
+  drawSignalWithPeaks(resultCanvas, timesMs, analysis.filtered, analysis.threshold, peakPoints,
+                      0, endMs);
+
+  // Frame-interval statistics (these move into dsp.assessQuality in P3).
+  const intervals = [];
+  for (let i = 1; i < samples.length; i++) {
+    intervals.push(samples[i].tMs - samples[i - 1].tMs);
+  }
+  intervals.sort((a, b) => a - b);
+  const pick = (q) => intervals.length ? intervals[Math.floor(q * (intervals.length - 1))] : NaN;
+  const medianInterval = pick(0.5);
+  const iqr = pick(0.75) - pick(0.25);
+  const durationS = samples.length ? samples[samples.length - 1].tMs / 1000 : 0;
+
+  const rows = [
+    ['Frames recorded', samples.length],
+    ['Duration', durationS.toFixed(1) + ' s'],
+    ['Median frame interval', medianInterval.toFixed(1) + ' ms (' + (1000 / medianInterval).toFixed(1) + ' fps)'],
+    ['Frame interval IQR', iqr.toFixed(1) + ' ms'],
+    ['Timestamp source', timestampSource],
+    ['Frames without finger', recordStats ? recordStats.noFingerFrames : 0],
+    ['Clipped (too bright) frames', recordStats ? recordStats.saturatedFrames : 0],
+    ['Torch', cameraInfo.torch ? 'on' : 'unavailable'],
+    ['Exposure locked', cameraInfo.exposureLocked ? 'yes' : 'no'],
+    ['White balance locked', cameraInfo.whiteBalanceLocked ? 'yes' : 'no'],
+    ['Camera', cameraInfo.label + ' (' + cameraInfo.width + 'x' + cameraInfo.height + ')'],
+  ];
+  summaryTable.innerHTML = '';
+  for (const [label, value] of rows) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    const td2 = document.createElement('td');
+    td1.textContent = label;
+    td2.textContent = String(value);
+    tr.appendChild(td1);
+    tr.appendChild(td2);
+    summaryTable.appendChild(tr);
+  }
+}
+
+// Save the raw {tMs, value} samples as a CSV file, so a recording can be
+// inspected or re-analysed later without re-recording.
+function downloadCsv() {
+  let text = 'tMs,red\n';
+  for (const s of samples) {
+    text += s.tMs.toFixed(3) + ',' + s.value.toFixed(4) + '\n';
+  }
+  const blob = new Blob([text], { type: 'text/csv' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'pulse-recording.csv';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Event wiring
+// ---------------------------------------------------------------------------
+btnStart.addEventListener('click', startMeasurement);
+btnAgain.addEventListener('click', startMeasurement);
+btnDownload.addEventListener('click', downloadCsv);
+btnCancel.addEventListener('click', () => abortMeasurement(null));
+btnSkipCheck.addEventListener('click', () => { skipFingerCheck = true; btnSkipCheck.hidden = true; });
+
+// If the user switches apps mid-recording, frames stop: abort cleanly.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && running) {
+    abortMeasurement('Measurement stopped because the app went into the background.');
+  }
+});
+</script>
+</body>
+</html>
