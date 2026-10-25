@@ -425,6 +425,7 @@ async function lockExposureAndWhiteBalance() {
 
 function stopCamera() {
   running = false;
+  frameSession += 1; // invalidates any frame callback still pending
   if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
   if (stream) {
     for (const t of stream.getTracks()) { t.stop(); } // stopping the track also turns the torch off
@@ -446,12 +447,23 @@ function stopCamera() {
 // ---------------------------------------------------------------------------
 const hasVideoFrameCallback = ('requestVideoFrameCallback' in HTMLVideoElement.prototype);
 
+// Each measurement gets a new session number. A frame callback that was
+// requested during an OLD measurement can still fire after a new one starts
+// (the video element is reused); without this check it would start a second
+// sampling loop and every frame would be recorded twice.
+let frameSession = 0;
+
 function scheduleNextFrame() {
   if (!running) return;
+  const session = frameSession;
   if (hasVideoFrameCallback) {
-    video.requestVideoFrameCallback(onVideoFrame);
+    video.requestVideoFrameCallback((now, metadata) => {
+      if (session === frameSession) onVideoFrame(now, metadata);
+    });
   } else {
-    requestAnimationFrame(onAnimationFrame);
+    requestAnimationFrame((now) => {
+      if (session === frameSession) onAnimationFrame(now);
+    });
   }
 }
 
@@ -521,6 +533,10 @@ function isFingerPresent(color) {
 
 // Called once per camera frame with that frame's timestamp in milliseconds.
 function handleFrame(tMs) {
+  // Second safety net: never process the same camera frame twice. A frame
+  // whose timestamp is not later than the previous one is a duplicate.
+  if (lastFrameTimeMs !== null && tMs <= lastFrameTimeMs) return;
+
   const color = readFrameColor();
   if (color === null) return;
   lastFrameWallMs = performance.now();
