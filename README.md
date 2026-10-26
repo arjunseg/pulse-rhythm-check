@@ -1,6 +1,6 @@
-# Pulse Rhythm Check
+# Cadence
 
-A browser app that estimates how **regular** your pulse rhythm is, using only a phone's rear camera and a fingertip. It records about 45 seconds of video brightness, extracts a photoplethysmogram (PPG), detects heartbeats, computes standard heart-rate-variability metrics, and reports **Regular**, **Irregular — suggest clinical evaluation**, or **Insufficient signal quality — please retry**.
+Cadence is a browser app that estimates how **regular** your pulse rhythm is, using only a phone's rear camera and a fingertip. It records about 45 seconds of video brightness, extracts a photoplethysmogram (PPG), detects heartbeats, computes standard heart-rate-variability metrics, and reports **Regular**, **Irregular — suggest clinical evaluation**, or **Insufficient signal quality — please retry**.
 
 - **Live app:** https://arjunseg.github.io/pulse-rhythm-check/
 - **Validation page:** https://arjunseg.github.io/pulse-rhythm-check/validate.html
@@ -92,20 +92,20 @@ cd "/path/to/this/folder"
 git init -b main
 git add index.html dsp.js validate.html README.md .gitignore
 git commit -m "Initial commit"
-gh repo create pulse-rhythm-check --public --source=. --push
-gh api -X POST repos/<your-username>/pulse-rhythm-check/pages -f "source[branch]=main" -f "source[path]=/"
+gh repo create <repo-name> --public --source=. --push
+gh api -X POST repos/<your-username>/<repo-name>/pages -f "source[branch]=main" -f "source[path]=/"
 ```
 
 The repository must be **public** for GitHub Pages on a free account. After 1–2 minutes, the site is live at:
 
 ```
-https://<your-username>.github.io/pulse-rhythm-check/
+https://<your-username>.github.io/<repo-name>/
 ```
 
 You can check build status with:
 
 ```bash
-gh api repos/<your-username>/pulse-rhythm-check/pages/builds/latest --jq .status
+gh api repos/<your-username>/<repo-name>/pages/builds/latest --jq .status
 ```
 
 **Without the CLI:** create a public repository on github.com, upload the files, then go to **Settings → Pages → Build and deployment**, choose **Deploy from a branch**, and select `main` / `/ (root)`.

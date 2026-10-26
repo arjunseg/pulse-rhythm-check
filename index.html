@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0e1116">
-<title>Pulse Rhythm Check</title>
+<title>Cadence</title>
 <style>
   :root {
     --bg: #0e1116;
@@ -161,7 +161,7 @@
 
   <!-- ===================== LANDING SCREEN ===================== -->
   <section id="screen-landing">
-    <h1>Pulse Rhythm Check</h1>
+    <h1>Cadence</h1>
     <p class="lede">
       An educational tool that estimates how regular your pulse rhythm is,
       using your phone's rear camera and a fingertip.
@@ -1420,7 +1420,7 @@ function downloadCsv() {
   const blob = new Blob([text], { type: 'text/csv' });
   const link = document.createElement('a');
   link.href = URL.createObjectURL(blob);
-  link.download = 'pulse-recording.csv';
+  link.download = 'cadence-recording.csv';
   link.click();
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }

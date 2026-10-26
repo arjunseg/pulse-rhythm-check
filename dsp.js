@@ -1,5 +1,5 @@
 // ============================================================================
-// dsp.js: pure signal-processing functions for the pulse rhythm app.
+// dsp.js: pure signal-processing functions for the Cadence app.
 //
 // Rules for this file:
 //   * No DOM access, no browser APIs, no mutable global state.
