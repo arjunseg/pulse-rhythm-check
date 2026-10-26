@@ -98,6 +98,21 @@
   table.kv td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
   .small { font-size: 0.85rem; color: var(--muted); }
   h3 { font-size: 1rem; margin: 20px 0 4px; }
+  details.upload { margin: 12px 0; }
+  details.upload summary { cursor: pointer; color: var(--muted); padding: 6px 0; }
+  .file-button {
+    display: block;
+    text-align: center;
+    font-size: 1.05rem;
+    font-weight: 600;
+    padding: 14px;
+    border-radius: 12px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    margin: 8px 0;
+    cursor: pointer;
+  }
+  .file-button input { display: none; }
   .big-number { font-size: 3rem; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
   .big-number .unit { font-size: 1rem; font-weight: 400; color: var(--muted); }
   .verdict {
@@ -171,6 +186,20 @@
 
     <button id="btn-start">Start measurement</button>
     <p id="landing-error" class="error" hidden></p>
+
+    <details class="upload">
+      <summary>Or analyse a recorded video</summary>
+      <p class="small">
+        Use your phone's Camera app to film your fingertip over the rear lens for about
+        50 seconds, with the flashlight on and the phone resting still. Then choose the video
+        here. The first 5 seconds are skipped and the next 45 seconds are analysed with
+        exactly the same steps as a live measurement. The video stays on your device.
+      </p>
+      <label class="file-button">
+        Choose video…
+        <input type="file" id="file-input" accept="video/*">
+      </label>
+    </details>
     <p class="small"><a href="./validate.html" style="color:#8ab4ff">How the signal processing was tested →</a></p>
   </section>
 
@@ -277,6 +306,7 @@ const CONFIG = {
   LIVE_DETREND_SECONDS: 1.5, // display-only baseline removal window (see drawLiveWave)
   SKIP_CHECK_AFTER_SECONDS: 10, // offer "start anyway" if finger detection stays unsure this long
   STALL_TIMEOUT_MS: 3000,    // abort if the camera delivers no frames for 3 s
+  MIN_UPLOAD_SECONDS: 25,    // shortest uploaded video we try to analyse
 
   // Finger-detection heuristic (ARBITRARY, tuned by eye, not published):
   // a fingertip lit from behind looks strongly red, so the red average must be
@@ -322,6 +352,7 @@ const btnStart = document.getElementById('btn-start');
 const btnCancel = document.getElementById('btn-cancel');
 const btnAgain = document.getElementById('btn-again');
 const btnSkipCheck = document.getElementById('btn-skip-check');
+const fileInput = document.getElementById('file-input');
 
 // Offscreen canvas used to read pixel values from each video frame.
 // willReadFrequently tells the browser we will call getImageData every frame,
@@ -352,6 +383,10 @@ let liveBuffer = [];          // recent {tMs, value} for the live waveform (any 
 let recordStats = null;       // counters collected during recording
 let wakeLock = null;
 let stallTimer = null;
+let inputSource = 'camera';   // 'camera' (live) or 'upload' (video file)
+let uploadStartMs = 0;        // for uploads: video time where analysis begins
+let uploadUrl = null;         // object URL of the uploaded file (released afterwards)
+let targetRecordSeconds = CONFIG.RECORD_SECONDS; // shorter for uploads under 50 s
 
 // ---------------------------------------------------------------------------
 // Screen switching
@@ -506,7 +541,14 @@ function stopCamera() {
   }
   stream = null;
   track = null;
+  video.pause();
   video.srcObject = null;
+  if (uploadUrl) {
+    video.removeAttribute('src');
+    video.load(); // detach the file from the video element
+    URL.revokeObjectURL(uploadUrl);
+    uploadUrl = null;
+  }
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
@@ -542,6 +584,14 @@ function scheduleNextFrame() {
 }
 
 function onVideoFrame(now, metadata) {
+  // Uploaded video: use the frame's position in the video itself
+  // (mediaTime, in seconds), which is exact regardless of playback speed.
+  if (inputSource === 'upload') {
+    timestampSource = 'video mediaTime (uploaded file)';
+    handleFrame(metadata.mediaTime * 1000);
+    scheduleNextFrame();
+    return;
+  }
   // Pick ONE clock on the first frame and keep it, so we never mix time bases.
   // captureTime = when the sensor captured the frame (best, not always present)
   // presentationTime = when the browser received the frame for display
@@ -567,6 +617,14 @@ function onVideoFrame(now, metadata) {
 }
 
 function onAnimationFrame(now) {
+  if (inputSource === 'upload') {
+    // Fallback for uploads: the video's current playback position.
+    // Repeated positions (same frame seen twice) are dropped in handleFrame.
+    timestampSource = 'video currentTime (fallback)';
+    handleFrame(video.currentTime * 1000);
+    scheduleNextFrame();
+    return;
+  }
   if (timestampSource === null) {
     timestampSource = 'requestAnimationFrame (fallback)';
   }
@@ -630,6 +688,14 @@ function handleFrame(tMs) {
 
   if (phase === 'settle') {
     handleSettleFrame(tMs, dtMs, finger);
+  } else if (phase === 'skip') {
+    // Uploaded video: ignore the opening seconds (finger being placed).
+    phaseLabel.textContent = 'Skipping the first seconds of the video';
+    countdownEl.textContent = Math.max(0, Math.ceil((uploadStartMs - tMs) / 1000));
+    if (tMs >= uploadStartMs) {
+      phase = 'record';
+      recordStartMs = null;
+    }
   } else if (phase === 'record') {
     handleRecordFrame(tMs, color, finger);
   }
@@ -688,11 +754,11 @@ function handleRecordFrame(tMs, color, finger) {
   if (!finger) recordStats.noFingerFrames += 1;
   if (color.r >= CONFIG.SATURATION_RED) recordStats.saturatedFrames += 1;
 
-  const remaining = Math.max(0, CONFIG.RECORD_SECONDS - relMs / 1000);
-  phaseLabel.textContent = 'Recording: keep still';
+  const remaining = Math.max(0, targetRecordSeconds - relMs / 1000);
+  phaseLabel.textContent = (inputSource === 'upload') ? 'Reading video frames…' : 'Recording: keep still';
   countdownEl.textContent = Math.ceil(remaining);
 
-  if (relMs >= CONFIG.RECORD_SECONDS * 1000) {
+  if (relMs >= targetRecordSeconds * 1000) {
     finishRecording();
   }
 }
@@ -1120,6 +1186,8 @@ function resetSession() {
   liveBuffer = [];
   recordStats = null;
   noticesEl.innerHTML = '';
+  inputSource = 'camera';
+  targetRecordSeconds = CONFIG.RECORD_SECONDS;
   btnSkipCheck.hidden = true;
   countdownEl.textContent = '–';
   phaseLabel.textContent = 'Starting camera…';
@@ -1158,6 +1226,96 @@ async function startMeasurement() {
 
   scheduleNextFrame();
 }
+
+// ---------------------------------------------------------------------------
+// VIDEO UPLOAD (fallback input)
+//
+// Plays a recorded fingertip video once at normal speed and samples it with
+// exactly the same per-frame code (readFrameColor -> handleFrame) as the live
+// camera. The samples then go through the same dsp.analyzeRecording().
+// Normal speed is used because speeding up playback makes browsers skip frames.
+// ---------------------------------------------------------------------------
+function waitForMetadata(videoEl) {
+  return new Promise((resolve, reject) => {
+    if (videoEl.readyState >= 1) { resolve(); return; }
+    videoEl.addEventListener('loadedmetadata', () => resolve(), { once: true });
+    videoEl.addEventListener('error', () => reject(new Error('unreadable video')), { once: true });
+  });
+}
+
+async function startUpload(file) {
+  landingError.hidden = true;
+  resetSession();
+  inputSource = 'upload';
+  showScreen('capture');
+  phaseLabel.textContent = 'Opening video…';
+
+  uploadUrl = URL.createObjectURL(file);
+  video.srcObject = null;
+  video.muted = true;
+  video.src = uploadUrl;
+
+  try {
+    await waitForMetadata(video);
+  } catch (err) {
+    abortMeasurement('Could not open this video file. Try a video recorded with the phone camera (MP4 or MOV).');
+    return;
+  }
+
+  const durationS = video.duration;
+  if (!Number.isFinite(durationS) || durationS < CONFIG.MIN_UPLOAD_SECONDS) {
+    abortMeasurement('This video is too short. Please record at least ' + CONFIG.MIN_UPLOAD_SECONDS +
+                     ' seconds (about 50 seconds is best).');
+    return;
+  }
+
+  // Skip the first 5 s if the video is long enough for 5 s + 45 s;
+  // otherwise analyse the last 45 s (or the whole video if shorter).
+  if (durationS >= CONFIG.SETTLE_SECONDS + CONFIG.RECORD_SECONDS) {
+    uploadStartMs = CONFIG.SETTLE_SECONDS * 1000;
+  } else {
+    uploadStartMs = Math.max(0, durationS - CONFIG.RECORD_SECONDS) * 1000;
+  }
+  targetRecordSeconds = Math.min(CONFIG.RECORD_SECONDS, durationS - uploadStartMs / 1000);
+
+  cameraInfo = {
+    label: 'Uploaded video: ' + file.name,
+    width: video.videoWidth,
+    height: video.videoHeight,
+    torch: null,               // null = not applicable for a file
+    exposureLocked: null,
+    whiteBalanceLocked: null,
+  };
+  addNotice('Analysing an uploaded video. It plays once at normal speed, so this takes about as long as the video.');
+
+  running = true;
+  phase = 'skip';
+  lastFrameWallMs = performance.now();
+  stallTimer = setInterval(() => {
+    if (running && performance.now() - lastFrameWallMs > CONFIG.STALL_TIMEOUT_MS) {
+      abortMeasurement('The video stopped playing. Please try again.');
+    }
+  }, 500);
+
+  try {
+    await video.play();
+  } catch (err) {
+    abortMeasurement('The browser would not play this video: ' + (err && err.message ? err.message : err));
+    return;
+  }
+  scheduleNextFrame();
+}
+
+// When an uploaded video ends before 45 s of analysis, use what we have.
+// (The quality gate decides whether that is enough.)
+video.addEventListener('ended', () => {
+  if (!running || inputSource !== 'upload') return;
+  if (phase === 'record' && samples.length > 0) {
+    finishRecording();
+  } else {
+    abortMeasurement('The video ended before any frames could be analysed.');
+  }
+});
 
 function abortMeasurement(message) {
   stopCamera();
@@ -1228,9 +1386,12 @@ function showResults() {
     ['Red pixels saturated (avg)', recordStats
       ? (100 * recordStats.sumSatFraction / recordStats.totalFrames).toFixed(1) + ' %'
       : '–'],
-    ['Torch', cameraInfo.torch ? 'on' : 'unavailable'],
-    ['Exposure locked', cameraInfo.exposureLocked ? 'yes (' + cameraInfo.exposureLocked + ')' : 'no'],
-    ['White balance locked', cameraInfo.whiteBalanceLocked ? 'yes (' + cameraInfo.whiteBalanceLocked + ')' : 'no'],
+    ['Input', inputSource === 'upload' ? 'uploaded video' : 'live camera'],
+    ['Torch', inputSource === 'upload' ? 'n/a' : (cameraInfo.torch ? 'on' : 'unavailable')],
+    ['Exposure locked', inputSource === 'upload' ? 'n/a'
+      : (cameraInfo.exposureLocked ? 'yes (' + cameraInfo.exposureLocked + ')' : 'no')],
+    ['White balance locked', inputSource === 'upload' ? 'n/a'
+      : (cameraInfo.whiteBalanceLocked ? 'yes (' + cameraInfo.whiteBalanceLocked + ')' : 'no')],
     ['Exposure modes offered', cameraInfo.exposureModesOffered || '–'],
     ['White balance modes offered', cameraInfo.whiteBalanceModesOffered || '–'],
     ['Camera', cameraInfo.label + ' (' + cameraInfo.width + 'x' + cameraInfo.height + ')'],
@@ -1270,6 +1431,11 @@ function downloadCsv() {
 btnStart.addEventListener('click', startMeasurement);
 btnAgain.addEventListener('click', startMeasurement);
 btnDownload.addEventListener('click', downloadCsv);
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files && fileInput.files[0];
+  fileInput.value = ''; // allow choosing the same file again later
+  if (file) startUpload(file);
+});
 btnCancel.addEventListener('click', () => abortMeasurement(null));
 btnSkipCheck.addEventListener('click', () => { skipFingerCheck = true; btnSkipCheck.hidden = true; });
 
